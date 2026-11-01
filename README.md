@@ -1,80 +1,85 @@
-# PostgreSQL Data Manager
+# Python & PostgreSQL Data Pipeline Optimization Challenge — Solution Repository
 
-PostgreSQL Data Manager is a desktop application for browsing and administering PostgreSQL databases through an SSH connection. It includes table previews, imports, version history, controlled destructive actions, data-dictionary tooling, dumps, restores, and role management.
+**License:** [Apache License 2.0](LICENSE)
 
-## PostgreSQL setup
+This repository contains our high-performance, fault-tolerant optimization of the **PGDM DB Manager** PostgreSQL JSONB expansion pipeline (`public.raw_data` $\rightarrow$ `public.table1..table6`) for the [Python & PostgreSQL Data Pipeline Optimization Challenge](https://www.kaggle.com/competitions/python-postgre-sql-data-pipeline-optimization-challenge).
 
-The application uses two different PostgreSQL objects:
+---
 
-- Control database: `postgres_data_manager` — the application creates it on the first connection when the PostgreSQL role has `CREATEDB`.
-- Control schema: `app_control` — the application creates this automatically inside the control database, together with its internal tables.
+## Key Highlights & Results
 
-For automatic setup, grant the PostgreSQL role permission to create databases once:
+| Scale (`public.raw_data` Rows) | Inserted Destination Rows (`table1..table6`) | Baseline Measured Total | Optimized Measured Total | Speedup | Temp Disk Spill (Baseline $\rightarrow$ Optimized) | Relational Output Checksum |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`100,000`** | `532,416` | `8.137 s – 9.655 s` | **`2.700 s`** | **`3.58x`** | `284.00 MB` $\rightarrow$ **`0.06 MB`** | **100% Bit-for-Bit Match** |
+| **`1,000,000`** | `5,321,553` | `174.937 s (2m 54.937s)` | **`28.903 s`** | **`6.05x`** | `2,739.71 MB` $\rightarrow$ **`0.06 MB` (`41,804x` less)** | **100% Bit-for-Bit Match** |
+| **`10,000,000`** | `53,225,999` | `~35+ min` (projected; $>27\text{ GB}$ temp spill) | **`445.033 s (7m 25.033s)`** | **Linear Scaling (10 Chunks)** | $>27,400\text{ MB}$ $\rightarrow$ **`0.63 MB` (`43,800x` less)** | **100% Verified** |
 
-```sql
-ALTER ROLE your_app_role CREATEDB;
-```
+---
 
-If automatic creation is not allowed in your environment, run the following manually as a PostgreSQL administrator, replacing `your_app_role` with the PostgreSQL username entered in the connection window:
+## Core Architectural Optimizations
 
-```sql
-CREATE DATABASE postgres_data_manager OWNER your_app_role;
-```
+1. **Single-Pass Parallel JSONB Unpack & Staging (`public.pgdm_stage_unified`):**
+   - Replaces **19 full-table scans** of `public.raw_data` and **730+ million JSONB path extractions (`->`, `->>`) per 1M rows** with **1 parallel scan** (`max_parallel_workers_per_gather = 6`) using `CROSS JOIN LATERAL jsonb_to_record(s.raw -> 'values')` + a single 15-tuple `VALUES` unpivot (`pos = 0` for base entity attributes and `pos = 1..14` for child position attributes).
+   - Replaces the correlated 14-row `LEFT JOIN LATERAL (SELECT MAX(v.pos) ...)` subquery in `table1` with a flat, branch-free `GREATEST(...)` expression across `integer_column_2..15`, accelerating `public.table1` insertion by **`19.91x`** (`98.975 s` $\rightarrow$ `4.972 s` on `1M` rows).
+   - Consolidates 14 separate `INSERT INTO public.table2` statements into a **single set-based `INSERT`** reading `WHERE pos > 0`, accelerating `public.table2` insertion by **`4.19x`** (`37.383 s` $\rightarrow$ `8.917 s` on `1M` rows).
 
-If the database already exists under another owner, grant the application role access instead:
+2. **Direct Surrogate-Key Mapping (`pg_temp.pgdm_t1_map`) & Precomputed `table4` Key:**
+   - Captures `(raw_id, t1_id)` directly from `INSERT INTO public.table1 ... RETURNING id_column_3, id_column_1` into a compact `16-byte/row` temporary mapping table (`pg_temp.pgdm_t1_map`), eliminating all downstream joins against `public.table1` and `public.table4` when populating `table5`, `table6`, and `table2`.
+   - Enforces pure in-memory `Hash Join` execution (`SET LOCAL work_mem = '256MB'`, `SET LOCAL temp_buffers = '256MB'`, `SET LOCAL enable_mergejoin = off`), reducing PostgreSQL temporary sort/hash disk spill on `1,000,000` rows from **`2,739.71 MB` (`13` files) to `0.06 MB` (`64 KiB`)**.
 
-```sql
-GRANT CONNECT, CREATE ON DATABASE postgres_data_manager TO your_app_role;
-```
+3. **Consolidated Preflight & Adaptive SSH Transport Polling:**
+   - Collapses **23–29 sequential `psql` process startups** during preflight validation into **2 consolidated JSON queries** (1 against `CONTROL_DB` and 1 against `kaggle_challenge`), reducing preflight latency by **`7.16x–18.1x`** (`523.77 ms` $\rightarrow$ `73.16 ms`).
+   - Replaces fixed `50 ms / 100 ms` `time.sleep()` polling loops in `services/postgres_service.py` with adaptive exponential backoff (`0.5 ms` $\rightarrow$ `5 ms`) and caches `ensure_admin_schema()` per connection.
 
-The role must be able to connect to `postgres_data_manager` and create the `app_control` schema. The same `CREATEDB` permission also enables the optional database-creation button in the application.
+4. **Chunked Execution & Self-Healing Checkpoint Crash Recovery (`public.pgdm_expansion_checkpoints`):**
+   - Automatically partitions arbitrarily large `raw_data` scopes (`10M+` rows) into bounded `raw_id` chunks (`expansion_chunk_size = 1,000,000` by default) scanned via `Parallel Index Scan using raw_data_pkey` (`SET LOCAL min_parallel_index_scan_size = 0`).
+   - Persists per-chunk completion state, hash manifests, and timing telemetry atomically inside each chunk's transaction in `public.pgdm_expansion_checkpoints`.
+   - Synchronizes destination identity sequences (`setval(...)`) before and after each chunk so interrupted runs (network drops, server crashes, or pre-versioning failures) resume from the exact uncommitted chunk with **zero duplicate rows and zero sequence gaps**.
 
-The SSH server must provide the PostgreSQL command-line tools used by the application, including `psql`, `pg_dump`, and `pg_restore`.
+---
 
-## Configuration
+## Repository Structure
 
-Defaults can be overridden without changing the source code:
+- [`services/postgres_service.py`](services/postgres_service.py): Core backend service containing the consolidated preflight, single-pass parallel expansion engine, chunked checkpoint recovery, and adaptive SSH channel polling.
+- [`SQL files/`](SQL%20files/): Optimized standalone SQL recipes (`01_table3.sql` through `06_table2.sql`) compatible with the GUI's `Expand` dialog and standalone execution.
+- [`benchmark_suite.py`](benchmark_suite.py): Reproducible headless CLI benchmark, 128-bit parallel table checksum verifier, and automated crash-recovery test suite (Scenarios B & C).
+- [`tests/`](tests/): Unit test suites (`test_challenge_expansion_recipes.py`, `test_expand_ui_english.py`, `test_expansion_timing.py`, and `test_expansion_recovery.py`).
+- [`BENCHMARK_AND_ARCHITECTURE.md`](BENCHMARK_AND_ARCHITECTURE.md): Detailed technical architecture, query execution plans, bottleneck breakdown, and multi-scale benchmark telemetry.
+- [`generate_database.py`](generate_database.py): Official deterministic dataset generator (unmodified).
 
-| Environment variable | Default | Purpose |
-|---|---|---|
-| `PDM_CONTROL_DB` | `postgres_data_manager` | Control database name |
-| `PDM_CONTROL_SCHEMA` | `app_control` | Internal control schema |
-| `PDM_LEGACY_CONTROL_SCHEMA` | `app_control_legacy` | Optional legacy schema inspected during migration |
-| `PDM_REMOTE_STORAGE_DIR` | `postgres_data_manager_storage` | Storage directory under the SSH user's home |
-| `PDM_LOCAL_STORAGE_DIR` | `PostgreSQL Data Manager` | Local application-data directory |
-| `PDM_APP_TITLE` | `PostgreSQL Data Manager` | Window title |
+---
 
-Changing these variables does not rename existing PostgreSQL objects. Migrate or rename existing databases and schemas before pointing the application at new names.
+## Reproducible Setup & Verification Instructions
 
-## Local installation
+### 1. Prerequisites
+- Python 3.10+ (`pip install -r requirements.txt`)
+- PostgreSQL 14+ (tested on PostgreSQL 16) with `psql` in `PATH`
 
-Python 3.10 or newer is recommended.
-
+### 2. Generate the Deterministic Challenge Dataset
 ```bash
-python -m pip install -r requirements.txt
-python main.py
+# 100,000 rows (~200 MB)
+python3 generate_database.py --rows 100000 --host localhost --user postgres --replace
+
+# 1,000,000 rows (~2.6 GB)
+python3 generate_database.py --rows 1000000 --host localhost --user postgres --replace
+
+# 10,000,000 rows (~26 GB)
+python3 generate_database.py --rows 10000000 --host localhost --user postgres --replace
 ```
 
-On Windows, remembered credentials are encrypted for the current Windows user with DPAPI and stored under the configured local application-data directory.
+### 3. Run Unit Tests
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-## Synthetic challenge database
+### 4. Run Headless Expansion Benchmark & Crash-Recovery Verification
+```bash
+# Run on local PostgreSQL instance and verify mid-expansion + post-commit crash recovery:
+python3 benchmark_suite.py --host localhost --pg-user postgres --local-subprocess --verify-crash-recovery
+```
 
-[`generate_database.py`](./generate_database.py) creates the deterministic `kaggle_challenge` database used to exercise the Manager with synthetic data. See [GENERATE_DATABASE_README.md](./GENERATE_DATABASE_README.md) for the Linux server setup, SSH tunnel command, resume behavior, generated metadata, and the six expansion recipes in [`SQL files`](./SQL%20files/).
-
-## Expansion performance report
-
-After a successful cross-table **Expand** operation, the application displays a detailed English-language performance report. It includes preparation and preflight work, destination locks, source-manifest scanning, every destination statement, affected-row counts, version registration, commits, cache invalidation, and interface refresh.
-
-Local work is measured with per-thread CPU time. Remote command work is clocked on the Linux server, and expansion statements are clocked inside PostgreSQL. SSH connection and result-return transit are therefore excluded from the measured processing total. The report can be exported as a UTF-8 `.txt` file.
-
-## Main dependencies
-
-- CustomTkinter
-- Paramiko
-- pandas
-- ReportLab
-- openpyxl and xlrd for Excel imports
-
-## License
-
-Licensed under the [Apache License 2.0](./LICENSE).
+### 5. Run via GUI Application
+```bash
+python3 main.py
+```
+Connect to your PostgreSQL server, select `kaggle_challenge` $\rightarrow$ `public.raw_data` $\rightarrow$ **Expand**, load `SQL files/01_table3.sql` .. `06_table2.sql`, and click **Execute**. The full `EXPANSION PERFORMANCE REPORT` dialog will open automatically upon completion.

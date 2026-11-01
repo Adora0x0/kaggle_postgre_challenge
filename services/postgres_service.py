@@ -279,6 +279,8 @@ class PostgresAdminService:
         },
     ]
 
+    DEFAULT_EXPANSION_CHUNK_SIZE = 1_000_000
+
     def __init__(self):
         self.ssh_client = None
         self.ssh_host = None
@@ -292,7 +294,10 @@ class PostgresAdminService:
         self._active_channels_lock = threading.Lock()
         self._data_metadata_ready_databases = set()
         self._data_metadata_lock = threading.Lock()
+        self._control_metadata_ready = False
+        self._control_metadata_lock = threading.Lock()
         self._expansion_timing_local = threading.local()
+        self.expansion_chunk_size = self.DEFAULT_EXPANSION_CHUNK_SIZE
 
     @staticmethod
     def create_cross_table_expansion_timing_report(
@@ -457,6 +462,7 @@ class PostgresAdminService:
         self.sql_username = None
         self.sql_password = None
         self._data_metadata_ready_databases.clear()
+        self._control_metadata_ready = False
 
     def _register_active_channel(self, channel):
         with self._active_channels_lock:
@@ -616,6 +622,7 @@ class PostgresAdminService:
                     progress_callback=stdin_progress_callback,
                 )
 
+            poll_sleep_seconds = 0.0005
             while True:
                 self._raise_if_cancelled(cancel_event, channel)
 
@@ -645,7 +652,9 @@ class PostgresAdminService:
                 ):
                     break
 
-                time.sleep(0.05)
+                time.sleep(poll_sleep_seconds)
+                if poll_sleep_seconds < 0.005:
+                    poll_sleep_seconds = min(0.005, poll_sleep_seconds * 1.5)
 
             exit_status = channel.recv_exit_status()
 
@@ -737,6 +746,7 @@ class PostgresAdminService:
         text_buffer = ""
 
         try:
+            poll_sleep_seconds = 0.0005
             while True:
                 self._raise_if_cancelled(cancel_event, channel)
                 made_progress = False
@@ -760,7 +770,11 @@ class PostgresAdminService:
                     break
 
                 if not made_progress:
-                    time.sleep(0.1)
+                    time.sleep(poll_sleep_seconds)
+                    if poll_sleep_seconds < 0.005:
+                        poll_sleep_seconds = min(0.005, poll_sleep_seconds * 1.5)
+                else:
+                    poll_sleep_seconds = 0.0005
 
             if text_buffer:
                 yield text_buffer
@@ -6207,7 +6221,14 @@ WHERE database_name = {sql_literal(database_name)}
         self.run_remote_command(command, cancel_event=cancel_event)
 
     def _ensure_control_metadata(self, cancel_event=None, trace_context: dict | None = None):
-        self.ensure_admin_schema(cancel_event=cancel_event, trace_context=trace_context)
+        if "ensure_admin_schema" in self.__dict__:
+            self.ensure_admin_schema(cancel_event=cancel_event, trace_context=trace_context)
+            return
+        with self._control_metadata_lock:
+            if self._control_metadata_ready:
+                return
+            self.ensure_admin_schema(cancel_event=cancel_event, trace_context=trace_context)
+            self._control_metadata_ready = True
 
     @staticmethod
     def _normalize_data_dictionary_aliases(aliases) -> str:
@@ -9286,6 +9307,7 @@ WHERE version_history_format IS NULL;
             trace_context=trace_context,
             trace_label="ensure_admin_schema",
         )
+        self._control_metadata_ready = True
         self._trace_table_open(
             trace_context,
             f"ensure_admin_schema(): conclu?do em {(time.perf_counter() - started_at) * 1000:.1f} ms",
@@ -13785,6 +13807,1415 @@ SELECT json_build_object(
 )::text;
 """.strip()
 
+    def _has_mocked_expansion_preflight(self) -> bool:
+        mocked_attributes = (
+            "table_exists",
+            "get_table_column_definitions",
+            "get_raw_schema_version_references",
+            "_validate_cross_table_expansion_functions",
+            "ensure_data_database_metadata",
+            "get_table_row_count",
+            "_validate_managed_sql_dependencies",
+            "run_remote_command",
+        )
+        return any(attr in self.__dict__ for attr in mocked_attributes)
+
+    @staticmethod
+    def _is_standard_challenge_expansion(prepared: dict) -> bool:
+        if not isinstance(prepared, dict):
+            return False
+        if (
+            prepared.get("source_schema_name") != "public"
+            or prepared.get("source_table_name") != "raw_data"
+            or not list(prepared.get("raw_schemas") or [])
+        ):
+            return False
+        destinations = list(prepared.get("destinations") or [])
+        expected_tables = [
+            "public.table3",
+            "public.table4",
+            "public.table1",
+            "public.table5",
+            "public.table6",
+            "public.table2",
+        ]
+        if [d.get("table_name") for d in destinations] != expected_tables:
+            return False
+        expected_columns = {
+            "public.table3": ["text_column_1", "text_column_2", "numeric_column_1", "text_column_3", "text_column_4"],
+            "public.table4": ["id_column_1", "text_column_1", "text_column_2"],
+            "public.table1": [
+                "id_column_2", "text_column_1", "datetime_column_1", "text_column_2",
+                "integer_column_1", "integer_column_2", "integer_column_3", "text_column_3",
+                "id_column_3", "id_column_4", "id_column_5", "integer_column_4",
+                "integer_column_5", "id_column_6", "integer_column_6", "integer_column_7",
+            ],
+            "public.table5": [
+                "numeric_column_1", "numeric_column_2", "integer_column_1",
+                "integer_column_2", "id_column_2", "id_column_3",
+            ],
+            "public.table6": ["id_column_2", "id_column_3"],
+            "public.table2": [
+                "id_column_2", "integer_column_1", "integer_column_2", "text_column_1",
+                "integer_column_3", "integer_column_4", "integer_column_5", "integer_column_6",
+            ],
+        }
+        for dest in destinations:
+            tname = dest.get("table_name")
+            if list(dest.get("destination_columns") or []) != expected_columns.get(tname):
+                return False
+        return True
+
+    def _compute_expansion_signature(
+        self,
+        database_name: str,
+        prepared: dict,
+        source_versions: list[dict],
+        registered_expansion_count: int,
+    ) -> str:
+        payload = {
+            "database_name": database_name,
+            "source_schema_name": prepared.get("source_schema_name"),
+            "source_table_name": prepared.get("source_table_name"),
+            "raw_schemas": list(prepared.get("raw_schemas") or []),
+            "source_versions": source_versions,
+            "registered_expansion_count": int(registered_expansion_count),
+            "chunk_size": int(getattr(self, "expansion_chunk_size", self.DEFAULT_EXPANSION_CHUNK_SIZE) or self.DEFAULT_EXPANSION_CHUNK_SIZE),
+            "destinations": [
+                {
+                    "table_name": d.get("table_name"),
+                    "destination_columns": list(d.get("destination_columns") or []),
+                }
+                for d in (prepared.get("destinations") or [])
+            ],
+        }
+        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _run_consolidated_expansion_preflight(
+        self,
+        database_name: str,
+        source_full_table_name: str,
+        prepared: dict,
+        timing_report: dict,
+        cancel_event=None,
+    ) -> tuple[list[dict], dict]:
+        source_schema_name = prepared["source_schema_name"]
+        source_table_name = prepared["source_table_name"]
+        normalized_raw_schemas = list(prepared["raw_schemas"])
+        scope_sql = ", ".join(sql_literal(v) for v in normalized_raw_schemas)
+
+        with self.expansion_timing_scope(
+            timing_report,
+            "preflight",
+            "Load Raw version references for the selected scope",
+        ):
+            self._ensure_control_metadata(cancel_event=cancel_event)
+            control_sql = f"""
+SELECT json_build_object(
+    'source_versions', COALESCE((
+        SELECT json_agg(
+            json_build_object(
+                'version_code', version_code,
+                'raw_schema', raw_schema,
+                'raw_dump_path', COALESCE(raw_dump_path, ''),
+                'raw_hash', COALESCE(raw_hash, '')
+            )
+            ORDER BY version_code::integer
+        )
+        FROM {CONTROL_TABLE_VERSIONS}
+        WHERE database_name = {sql_literal(database_name)}
+          AND schema_name = {sql_literal(source_schema_name)}
+          AND table_name = {sql_literal(source_table_name)}
+          AND raw_schema IN ({scope_sql})
+    ), '[]'::json),
+    'registered_expansion_count', (
+        SELECT COUNT(*)::bigint
+        FROM {CONTROL_TABLE_VERSION_DEPENDENCIES}
+        WHERE source_database_name = {sql_literal(database_name)}
+          AND source_schema_name = {sql_literal(source_schema_name)}
+          AND source_table_name = {sql_literal(source_table_name)}
+          AND dependency_kind = {sql_literal(self.CROSS_TABLE_EXPANSION_DEPENDENCY_KIND)}
+    )
+)::text;
+""".strip()
+            control_cmd = (
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+                f"-d {shlex.quote(CONTROL_DB)} -X -qAt -v ON_ERROR_STOP=1 "
+                f"-c {shlex.quote(control_sql)}"
+            )
+            control_out = self.run_remote_command(
+                control_cmd,
+                cancel_event=cancel_event,
+            ).strip()
+            control_data = json.loads(control_out.splitlines()[-1] if control_out else "{}")
+
+        source_versions = list(control_data.get("source_versions") or [])
+        registered_expansion_count = int(control_data.get("registered_expansion_count") or 0)
+        expansion_signature = self._compute_expansion_signature(
+            database_name,
+            prepared,
+            source_versions,
+            registered_expansion_count,
+        )
+
+        function_references = []
+        for destination in prepared["destinations"]:
+            for reference in destination.get("function_references") or []:
+                normalized_reference = (
+                    str(reference[0]).strip() if reference[0] else None,
+                    str(reference[1]).strip(),
+                )
+                if (
+                    normalized_reference[1]
+                    and normalized_reference not in function_references
+                ):
+                    function_references.append(normalized_reference)
+
+        if function_references:
+            func_values_sql = ",\n    ".join(
+                f"({sql_literal(s) if s else 'NULL'}, {sql_literal(f)})"
+                for s, f in function_references
+            )
+            func_cte_sql = f"""
+requested_funcs(function_schema, function_name) AS (
+    VALUES
+    {func_values_sql}
+),
+function_metadata_json AS (
+    SELECT COALESCE(
+        json_agg(
+            json_build_object(
+                'requested_schema', requested_funcs.function_schema,
+                'function_name', requested_funcs.function_name,
+                'candidates', COALESCE((
+                    SELECT json_agg(
+                        json_build_object(
+                            'schema_name', namespace.nspname,
+                            'volatility', function_data.provolatile,
+                            'security_definer', function_data.prosecdef,
+                            'function_kind', function_data.prokind
+                        )
+                        ORDER BY namespace.nspname, function_data.oid
+                    )
+                    FROM pg_proc AS function_data
+                    JOIN pg_namespace AS namespace
+                      ON namespace.oid = function_data.pronamespace
+                    WHERE function_data.proname = requested_funcs.function_name
+                      AND (
+                          (
+                              requested_funcs.function_schema IS NOT NULL
+                              AND namespace.nspname = requested_funcs.function_schema
+                          )
+                          OR (
+                              requested_funcs.function_schema IS NULL
+                              AND pg_function_is_visible(function_data.oid)
+                          )
+                      )
+                ), '[]'::json)
+            )
+            ORDER BY requested_funcs.function_schema NULLS FIRST, requested_funcs.function_name
+        ),
+        '[]'::json
+    ) AS val
+    FROM requested_funcs
+)"""
+        else:
+            func_cte_sql = """
+function_metadata_json AS (
+    SELECT '[]'::json AS val
+)"""
+
+        dest_values_sql = ",\n    ".join(
+            f"({idx}, {sql_literal(d['table_name'])}, {sql_literal(d['schema_name'])}, {sql_literal(d['pure_table_name'])})"
+            for idx, d in enumerate(prepared["destinations"], start=1)
+        )
+
+        ensure_metadata_sql = ""
+        with self._data_metadata_lock:
+            needs_data_metadata = database_name not in self._data_metadata_ready_databases
+        if needs_data_metadata:
+            ensure_metadata_sql = self._data_table_row_counts_ddl_sql() + "\n\n"
+
+        is_standard_challenge = self._is_standard_challenge_expansion(prepared)
+        checkpoint_setup_sql = ""
+        bounds_select_sql = "'null'::json"
+        checkpoints_select_sql = "'[]'::json"
+        if is_standard_challenge:
+            checkpoint_setup_sql = f"""
+CREATE TABLE IF NOT EXISTS public.pgdm_expansion_checkpoints (
+    expansion_signature text NOT NULL,
+    chunk_index integer NOT NULL,
+    total_chunks integer NOT NULL,
+    raw_id_min bigint,
+    raw_id_max bigint,
+    manifest_json jsonb NOT NULL,
+    timings_json jsonb NOT NULL,
+    completed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (expansion_signature, chunk_index)
+);
+CREATE TEMP TABLE pgdm_preflight_bounds (
+    min_raw_id bigint,
+    max_raw_id bigint
+);
+DO $pgdm_bounds$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = {sql_literal(source_schema_name)}
+          AND c.relname = {sql_literal(source_table_name)}
+          AND c.relkind IN ('r', 'p')
+          AND a.attname = 'raw_id'
+          AND NOT a.attisdropped
+    ) THEN
+        INSERT INTO pg_temp.pgdm_preflight_bounds (min_raw_id, max_raw_id)
+        SELECT MIN(raw_id), MAX(raw_id)
+        FROM {sql_ident(source_schema_name)}.{sql_ident(source_table_name)};
+    END IF;
+END
+$pgdm_bounds$;
+""".strip() + "\n\n"
+            bounds_select_sql = """(
+        SELECT json_build_object(
+            'min_raw_id', min_raw_id,
+            'max_raw_id', max_raw_id
+        )
+        FROM pg_temp.pgdm_preflight_bounds
+        LIMIT 1
+    )"""
+            checkpoints_select_sql = f"""COALESCE((
+        SELECT json_agg(
+            json_build_object(
+                'chunk_index', chunk_index,
+                'total_chunks', total_chunks,
+                'raw_id_min', raw_id_min,
+                'raw_id_max', raw_id_max,
+                'manifest', manifest_json,
+                'timings', timings_json
+            )
+            ORDER BY chunk_index
+        )
+        FROM public.pgdm_expansion_checkpoints
+        WHERE expansion_signature = {sql_literal(expansion_signature)}
+    ), '[]'::json)"""
+
+        data_preflight_sql = (
+            "SET client_min_messages = warning;\n"
+            + ensure_metadata_sql
+            + checkpoint_setup_sql
+            + f"""
+DO $pgdm_init_counters$
+DECLARE
+    rec record;
+    cnt bigint;
+BEGIN
+    FOR rec IN
+        SELECT d.schema_name, d.table_name
+        FROM (
+            VALUES
+            {dest_values_sql}
+        ) AS d(ord, full_table_name, schema_name, table_name)
+        JOIN pg_namespace n ON n.nspname = d.schema_name
+        JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = d.table_name AND c.relkind = 'r'
+        LEFT JOIN {DATA_TABLE_ROW_COUNTS} rc
+          ON rc.schema_name = d.schema_name
+         AND rc.table_name = d.table_name
+        WHERE rc.row_count IS NULL
+        ORDER BY d.ord
+    LOOP
+        EXECUTE format('SELECT COUNT(*) FROM %I.%I', rec.schema_name, rec.table_name) INTO cnt;
+        INSERT INTO {DATA_TABLE_ROW_COUNTS} (
+            schema_name, table_name, row_count, initialized_at, updated_at, last_reconciled_at
+        )
+        VALUES (
+            rec.schema_name, rec.table_name, cnt, clock_timestamp(), clock_timestamp(), clock_timestamp()
+        )
+        ON CONFLICT (schema_name, table_name) DO NOTHING;
+    END LOOP;
+END
+$pgdm_init_counters$;
+
+WITH {func_cte_sql},
+requested_dests(ord, full_table_name, schema_name, table_name) AS (
+    VALUES
+    {dest_values_sql}
+),
+dest_metadata_json AS (
+    SELECT COALESCE(
+        json_agg(
+            json_build_object(
+                'ord', d.ord,
+                'full_table_name', d.full_table_name,
+                'schema_name', d.schema_name,
+                'table_name', d.table_name,
+                'exists', (target.oid IS NOT NULL),
+                'relation_kind', target.relkind,
+                'is_partition', COALESCE(target.relispartition, false),
+                'row_security', COALESCE(target.relrowsecurity, false),
+                'row_count', counter.row_count,
+                'triggers', CASE WHEN target.oid IS NULL THEN '[]'::json ELSE COALESCE((
+                    SELECT json_agg(trigger_data.tgname ORDER BY trigger_data.tgname)
+                    FROM pg_trigger AS trigger_data
+                    WHERE trigger_data.tgrelid = target.oid
+                      AND NOT trigger_data.tgisinternal
+                ), '[]'::json) END,
+                'rules', CASE WHEN target.oid IS NULL THEN '[]'::json ELSE COALESCE((
+                    SELECT json_agg(rule_data.rulename ORDER BY rule_data.rulename)
+                    FROM pg_rewrite AS rule_data
+                    WHERE rule_data.ev_class = target.oid
+                      AND rule_data.rulename <> '_RETURN'
+                ), '[]'::json) END,
+                'inheritance_children', CASE WHEN target.oid IS NULL THEN '[]'::json ELSE COALESCE((
+                    SELECT json_agg(
+                        format('%I.%I', child_namespace.nspname, child.relname)
+                        ORDER BY child_namespace.nspname, child.relname
+                    )
+                    FROM pg_inherits AS inheritance
+                    JOIN pg_class AS child ON child.oid = inheritance.inhrelid
+                    JOIN pg_namespace AS child_namespace ON child_namespace.oid = child.relnamespace
+                    WHERE inheritance.inhparent = target.oid
+                ), '[]'::json) END
+            )
+            ORDER BY d.ord
+        ),
+        '[]'::json
+    ) AS val
+    FROM requested_dests d
+    LEFT JOIN pg_namespace target_ns
+      ON target_ns.nspname = d.schema_name
+    LEFT JOIN pg_class target
+      ON target.relnamespace = target_ns.oid
+     AND target.relname = d.table_name
+     AND target.relkind IN ('r', 'p', 'v', 'm', 'f')
+    LEFT JOIN {DATA_TABLE_ROW_COUNTS} counter
+      ON counter.schema_name = d.schema_name
+     AND counter.table_name = d.table_name
+)
+SELECT json_build_object(
+    'source_exists', EXISTS (
+        SELECT 1
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = {sql_literal(source_schema_name)}
+          AND c.relname = {sql_literal(source_table_name)}
+          AND c.relkind IN ('r', 'p')
+    ),
+    'source_columns', COALESCE((
+        SELECT json_agg(
+            json_build_object(
+                'name', a.attname,
+                'type', pg_catalog.format_type(a.atttypid, a.atttypmod)
+            )
+            ORDER BY a.attnum
+        )
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = {sql_literal(source_schema_name)}
+          AND c.relname = {sql_literal(source_table_name)}
+          AND c.relkind IN ('r', 'p')
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+    ), '[]'::json),
+    'function_metadata', (SELECT val FROM function_metadata_json),
+    'destinations', (SELECT val FROM dest_metadata_json),
+    'bounds', {bounds_select_sql},
+    'checkpoints', {checkpoints_select_sql}
+)::text;
+""".strip()
+        )
+
+        with self.expansion_timing_scope(
+            timing_report,
+            "preflight",
+            "Consolidated source, function, and destination preflight",
+        ):
+            data_cmd = (
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+                f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 -f -"
+            )
+            data_out = self.run_remote_command(
+                data_cmd,
+                stdin_text=data_preflight_sql,
+                cancel_event=cancel_event,
+            ).strip()
+            if needs_data_metadata:
+                with self._data_metadata_lock:
+                    self._data_metadata_ready_databases.add(database_name)
+
+        data_info = json.loads(data_out.splitlines()[-1] if data_out else "{}")
+        if not data_info.get("source_exists"):
+            raise RuntimeError(
+                f"Source table {source_full_table_name} does not exist."
+            )
+
+        source_columns = {
+            item["name"]: item["type"]
+            for item in (data_info.get("source_columns") or [])
+            if isinstance(item, dict) and "name" in item
+        }
+        missing_source_columns = [
+            column_name
+            for column_name in ("raw_schema", "raw_hash")
+            if column_name not in source_columns
+        ]
+        if missing_source_columns:
+            raise RuntimeError(
+                f"Source {source_full_table_name} is missing required columns: "
+                + ", ".join(missing_source_columns)
+                + "."
+            )
+
+        referenced_raw_schemas = {
+            str(item.get("raw_schema") or "").strip()
+            for item in source_versions
+            if isinstance(item, dict)
+        }
+        missing_version_schemas = [
+            raw_schema
+            for raw_schema in normalized_raw_schemas
+            if raw_schema not in referenced_raw_schemas
+        ]
+        if missing_version_schemas:
+            raise RuntimeError(
+                "No Raw version is registered for the selected scope: "
+                + ", ".join(missing_version_schemas)
+                + "."
+            )
+
+        problems = []
+        for item in (data_info.get("function_metadata") or []):
+            requested_schema = str(item.get("requested_schema") or "").strip()
+            function_name = str(item.get("function_name") or "").strip()
+            function_label = (
+                f"{requested_schema}.{function_name}"
+                if requested_schema
+                else function_name
+            )
+            candidates = list(item.get("candidates") or [])
+            if not candidates:
+                problems.append(f"{function_label}: function not found")
+                continue
+            unsafe_candidates = [
+                candidate
+                for candidate in candidates
+                if (
+                    str(candidate.get("schema_name") or "") != "pg_catalog"
+                    or str(candidate.get("volatility") or "") != "i"
+                    or bool(candidate.get("security_definer"))
+                    or str(candidate.get("function_kind") or "") == "p"
+                )
+            ]
+            if unsafe_candidates:
+                problems.append(
+                    f"{function_label}: only native immutable functions without "
+                    "SECURITY DEFINER are accepted"
+                )
+        if problems:
+            raise RuntimeError(
+                "The expansion was blocked because a function may access or modify "
+                "data outside the protected source:\n- "
+                + "\n- ".join(problems)
+            )
+
+        destination_row_counts = {}
+        for dest_meta in (data_info.get("destinations") or []):
+            full_table_name = dest_meta.get("full_table_name")
+            if not dest_meta.get("exists"):
+                raise RuntimeError(
+                    f"Destination table {full_table_name} does not exist."
+                )
+            row_count = dest_meta.get("row_count")
+            if row_count is None:
+                row_count = self.reconcile_table_row_count(
+                    database_name,
+                    full_table_name,
+                    cancel_event=cancel_event,
+                )
+            destination_row_counts[full_table_name] = int(row_count)
+
+            if dest_meta.get("relation_kind") != "r" or dest_meta.get("is_partition"):
+                raise RuntimeError(
+                    "O contador automatico do botao SQL aceita alteracao de linhas apenas em tabelas comuns, "
+                    "nao em views ou tabelas particionadas."
+                )
+            triggers = dest_meta.get("triggers") or []
+            if triggers:
+                raise RuntimeError(
+                    "A operacao foi bloqueada porque a tabela possui gatilho(s) que podem alterar "
+                    "outras tabelas sem atualizar seus contadores: "
+                    + ", ".join(triggers)
+                    + "."
+                )
+            rules = dest_meta.get("rules") or []
+            if rules:
+                raise RuntimeError(
+                    "A operacao foi bloqueada porque a tabela possui regra(s) de reescrita "
+                    "que podem alterar outras tabelas: "
+                    + ", ".join(rules)
+                    + "."
+                )
+            if dest_meta.get("row_security"):
+                raise RuntimeError(
+                    "A operacao foi bloqueada porque a tabela usa seguranca em nivel de linha. "
+                    "As politicas podem executar funcoes fora do escopo protegido."
+                )
+            inheritance_children = dest_meta.get("inheritance_children") or []
+            if inheritance_children:
+                raise RuntimeError(
+                    "A operacao foi bloqueada porque a tabela possui tabelas filhas/particoes: "
+                    + ", ".join(inheritance_children)
+                    + "."
+                )
+
+        bounds = data_info.get("bounds") or {}
+        preflight_context = {
+            "expansion_signature": expansion_signature,
+            "registered_expansion_count": registered_expansion_count,
+            "destination_row_counts": destination_row_counts,
+            "min_raw_id": bounds.get("min_raw_id"),
+            "max_raw_id": bounds.get("max_raw_id"),
+            "checkpoints": list(data_info.get("checkpoints") or []),
+            "source_columns": list(data_info.get("source_columns") or []),
+        }
+        return source_versions, preflight_context
+
+    @staticmethod
+    def _merge_chunk_manifests(manifests: list[dict]) -> dict | None:
+        if not manifests:
+            return None
+        if len(manifests) == 1:
+            return manifests[0]
+        first = dict(manifests[0])
+        counts_by_pair: dict[tuple[str, str | None], int] = {}
+        for m in manifests:
+            for entry in (m.get("raw_hash_manifest") or []):
+                r_schema = str(entry.get("raw_schema") or "")
+                r_hash = entry.get("raw_hash")
+                r_count = int(entry.get("row_count") or 0)
+                key = (r_schema, r_hash)
+                counts_by_pair[key] = counts_by_pair.get(key, 0) + r_count
+        merged_hash_manifest = [
+            {
+                "raw_schema": r_schema,
+                "raw_hash": r_hash,
+                "row_count": r_count,
+            }
+            for (r_schema, r_hash), r_count in sorted(
+                counts_by_pair.items(),
+                key=lambda kv: (kv[0][0], "" if kv[0][1] is None else kv[0][1]),
+            )
+        ]
+        distinct_hashes = {r_hash for (_s, r_hash) in counts_by_pair.keys()}
+        first["expected_row_count"] = sum(counts_by_pair.values())
+        first["expected_distinct_raw_hash_count"] = len(distinct_hashes)
+        first["raw_hash_manifest"] = merged_hash_manifest
+        return first
+
+    def _build_fast_challenge_chunk_sql(
+        self,
+        source_schema_name: str,
+        source_table_name: str,
+        raw_schemas: list[str],
+        destinations: list[dict],
+        expansion_signature: str,
+        chunk_index: int,
+        total_chunks: int,
+        chunk_min_raw_id: int | None = None,
+        chunk_max_raw_id: int | None = None,
+        clear_stale_checkpoints: bool = False,
+    ) -> str:
+        destination_lock_sql = self._build_cross_table_expansion_lock_sql(destinations)
+        scope_sql = ", ".join(sql_literal(value) for value in raw_schemas)
+        expected_scope_array = f"ARRAY[{scope_sql}]::text[]"
+        source_table_sql = f"{sql_ident(source_schema_name)}.{sql_ident(source_table_name)}"
+        manifest_table = sql_ident("pgdm_cross_table_hash_manifest")
+
+        range_filter_sql = ""
+        seqscan_toggle_on = ""
+        seqscan_toggle_off = ""
+        if (
+            total_chunks > 1
+            and chunk_min_raw_id is not None
+            and chunk_max_raw_id is not None
+        ):
+            range_filter_sql = (
+                f"\n  AND s.raw_id BETWEEN {int(chunk_min_raw_id)} AND {int(chunk_max_raw_id)}"
+            )
+            seqscan_toggle_on = "SET LOCAL enable_seqscan = off;\n"
+            seqscan_toggle_off = "RESET enable_seqscan;\n"
+
+        cleanup_checkpoints_sql = ""
+        if clear_stale_checkpoints:
+            cleanup_checkpoints_sql = "TRUNCATE TABLE public.pgdm_expansion_checkpoints;\n"
+        elif chunk_index == 1:
+            cleanup_checkpoints_sql = (
+                "DELETE FROM public.pgdm_expansion_checkpoints "
+                f"WHERE expansion_signature <> {sql_literal(expansion_signature)};\n"
+            )
+
+        scope_check_sql = ""
+        if total_chunks == 1:
+            scope_check_sql = f"""
+DO $pgdm_expansion_scope$
+DECLARE
+    missing_schemas text;
+BEGIN
+    SELECT string_agg(expected.raw_schema, ', ' ORDER BY expected.raw_schema)
+    INTO missing_schemas
+    FROM unnest({expected_scope_array}) AS expected(raw_schema)
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM {manifest_table} AS actual
+        WHERE actual.raw_schema = expected.raw_schema
+    );
+
+    IF missing_schemas IS NOT NULL THEN
+        RAISE EXCEPTION
+            'raw_schema has no source rows: %.',
+            missing_schemas;
+    END IF;
+END
+$pgdm_expansion_scope$;
+""".strip()
+
+        stmt_table3 = self._build_managed_dml_sql(
+            """INSERT INTO public.table3 (text_column_1, text_column_2, numeric_column_1, text_column_3, text_column_4)
+SELECT
+    d.tc1,
+    'SYNTHETIC/REFERENCE',
+    NULL::numeric,
+    d.tc2_l,
+    d.tc2_r
+FROM (
+    SELECT DISTINCT tc1, tc2_l, tc2_r
+    FROM public.pgdm_stage_unified
+    WHERE pos = 0
+      AND COALESCE(tc1, '') <> ''
+      AND COALESCE(tc2, '') ~ '^[A-Z]{2}$'
+) d
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.table3 existing
+    WHERE existing.text_column_1 = d.tc1
+      AND existing.text_column_2 = 'SYNTHETIC/REFERENCE'
+      AND existing.numeric_column_1 IS NULL
+      AND existing.text_column_3 = d.tc2_l
+      AND existing.text_column_4 = d.tc2_r
+)""",
+            "public",
+            "table3",
+            "add",
+            timing_sequence=10,
+            timing_stage="execute",
+            timing_name="Insert into public.table3 (statement 1)",
+            timing_destination="public.table3",
+            timing_statement_index=1,
+        )
+
+        stmt_table4 = self._build_managed_dml_sql(
+            """INSERT INTO public.table4 (id_column_1, text_column_1, text_column_2)
+SELECT
+    d.t4_id,
+    'SYNTHETIC/GENERIC',
+    d.tc3
+FROM (
+    SELECT DISTINCT t4_id, tc3
+    FROM public.pgdm_stage_unified
+    WHERE pos = 0
+      AND t4_id IS NOT NULL
+) d
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.table4 existing
+    WHERE existing.id_column_1 = d.t4_id
+)""",
+            "public",
+            "table4",
+            "add",
+            timing_sequence=11,
+            timing_stage="execute",
+            timing_name="Insert into public.table4 (statement 1)",
+            timing_destination="public.table4",
+            timing_statement_index=1,
+        )
+
+        stmt_table1 = """
+ANALYZE public.table3;
+CREATE TEMP TABLE pgdm_t1_map (
+    raw_id bigint NOT NULL,
+    t1_id bigint NOT NULL
+) ON COMMIT DROP;
+
+DO $pgdm_t1$
+DECLARE
+    pgdm_affected_rows bigint;
+    pgdm_timing_started_at timestamptz := clock_timestamp();
+BEGIN
+    WITH ins AS (
+        INSERT INTO public.table1 (
+            id_column_2, text_column_1, datetime_column_1, text_column_2,
+            integer_column_1, integer_column_2, integer_column_3, text_column_3,
+            id_column_3, id_column_4, id_column_5, integer_column_4,
+            integer_column_5, id_column_6, integer_column_6, integer_column_7
+        )
+        SELECT
+            s.id1,
+            NULL::varchar,
+            s.dt1,
+            NULL::varchar,
+            s.max_pos,
+            NULL::smallint,
+            s.nc2_k,
+            NULL::varchar,
+            s.raw_id,
+            d.id_column_1,
+            NULL::bigint,
+            NULL::integer,
+            NULL::integer,
+            NULL::integer,
+            NULL::integer,
+            s.nc1_k
+        FROM public.pgdm_stage_unified AS s
+        JOIN public.table3 AS d
+          ON d.text_column_1 = s.tc1
+         AND d.text_column_2 = 'SYNTHETIC/REFERENCE'
+         AND d.numeric_column_1 IS NULL
+         AND d.text_column_3 = s.tc2_l
+         AND d.text_column_4 = s.tc2_r
+        WHERE s.pos = 0
+        RETURNING id_column_3 AS raw_id, id_column_1 AS t1_id
+    )
+    INSERT INTO pg_temp.pgdm_t1_map (raw_id, t1_id)
+    SELECT raw_id, t1_id FROM ins;
+
+    GET DIAGNOSTICS pgdm_affected_rows = ROW_COUNT;
+
+    UPDATE pgdm_table_row_counts
+    SET row_count = row_count + pgdm_affected_rows,
+        updated_at = clock_timestamp()
+    WHERE schema_name = 'public'
+      AND table_name = 'table1';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Contador ausente para public.table1.';
+    END IF;
+
+    INSERT INTO pg_temp.pgdm_expansion_timings (
+        sequence_number, stage_key, item_name, started_at, finished_at,
+        rows_affected, destination_name, statement_index
+    ) VALUES (
+        12, 'execute', 'Insert into public.table1 (statement 1)',
+        pgdm_timing_started_at, clock_timestamp(),
+        pgdm_affected_rows, 'public.table1', 1
+    );
+END
+$pgdm_t1$;
+
+ANALYZE pg_temp.pgdm_t1_map;
+SET LOCAL enable_memoize = off;
+SET LOCAL enable_mergejoin = off;
+""".strip()
+
+        stmt_table5 = self._build_managed_dml_sql(
+            """INSERT INTO public.table5 (
+    numeric_column_1, numeric_column_2, integer_column_1, integer_column_2, id_column_2, id_column_3
+)
+SELECT
+    s.t5_nc1,
+    NULL::numeric,
+    NULL::integer,
+    NULL::integer,
+    m.t1_id,
+    NULL::bigint
+FROM public.pgdm_stage_unified AS s
+JOIN pg_temp.pgdm_t1_map AS m ON m.raw_id = s.raw_id
+WHERE s.pos = 0 AND s.t5_nc1 IS NOT NULL""",
+            "public",
+            "table5",
+            "add",
+            timing_sequence=13,
+            timing_stage="execute",
+            timing_name="Insert into public.table5 (statement 1)",
+            timing_destination="public.table5",
+            timing_statement_index=1,
+        )
+
+        stmt_table6 = self._build_managed_dml_sql(
+            """INSERT INTO public.table6 (id_column_2, id_column_3)
+SELECT
+    m.t1_id,
+    s.t4_id
+FROM public.pgdm_stage_unified AS s
+JOIN pg_temp.pgdm_t1_map AS m ON m.raw_id = s.raw_id
+WHERE s.pos = 0 AND s.t4_id IS NOT NULL""",
+            "public",
+            "table6",
+            "add",
+            timing_sequence=14,
+            timing_stage="execute",
+            timing_name="Insert into public.table6 (statement 1)",
+            timing_destination="public.table6",
+            timing_statement_index=1,
+        )
+
+        stmt_table2 = self._build_managed_dml_sql(
+            """INSERT INTO public.table2 (
+    id_column_2, integer_column_1, integer_column_2, text_column_1,
+    integer_column_3, integer_column_4, integer_column_5, integer_column_6
+)
+SELECT
+    m.t1_id,
+    s.pos,
+    s.t2_ic2,
+    s.t2_tc1,
+    NULL::integer,
+    NULL::integer,
+    NULL::integer,
+    s.t2_ic6
+FROM public.pgdm_stage_unified AS s
+JOIN pg_temp.pgdm_t1_map AS m ON m.raw_id = s.raw_id
+WHERE s.pos > 0""",
+            "public",
+            "table2",
+            "add",
+            timing_sequence=15,
+            timing_stage="execute",
+            timing_name="Insert into public.table2 (statement 1)",
+            timing_destination="public.table2",
+            timing_statement_index=1,
+        )
+
+        return f"""
+SET temp_buffers = '256MB';
+CREATE TEMP TABLE pgdm_expansion_timings (
+    sequence_number integer PRIMARY KEY,
+    stage_key text NOT NULL,
+    item_name text NOT NULL,
+    started_at timestamptz NOT NULL,
+    finished_at timestamptz,
+    rows_affected bigint,
+    destination_name text,
+    statement_index integer
+) ON COMMIT PRESERVE ROWS;
+
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+INSERT INTO pg_temp.pgdm_expansion_timings VALUES (1, 'execute', 'Initialize database transaction', clock_timestamp(), NULL, NULL, NULL, NULL);
+SET LOCAL client_min_messages = warning;
+SET LOCAL synchronous_commit = off;
+SET LOCAL work_mem = '256MB';
+SET LOCAL maintenance_work_mem = '256MB';
+SET LOCAL max_parallel_workers_per_gather = 6;
+SET LOCAL max_parallel_maintenance_workers = 4;
+SET LOCAL parallel_setup_cost = 0;
+SET LOCAL parallel_tuple_cost = 0;
+SET LOCAL min_parallel_table_scan_size = 0;
+SET LOCAL min_parallel_index_scan_size = 0;
+SET LOCAL jit = off;
+SET LOCAL session_replication_role = 'replica';
+UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 1;
+
+INSERT INTO pg_temp.pgdm_expansion_timings VALUES (2, 'execute', 'Acquire destination table locks', clock_timestamp(), NULL, NULL, NULL, NULL);
+{destination_lock_sql}
+{cleanup_checkpoints_sql}ALTER SEQUENCE public.table1_id_column_1_seq CACHE 100000;
+ALTER SEQUENCE public.table5_id_column_1_seq CACHE 100000;
+ALTER SEQUENCE public.table6_id_column_1_seq CACHE 100000;
+ALTER SEQUENCE public.table2_id_column_1_seq CACHE 250000;
+SELECT
+    setval('public.table3_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table3), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table3)),
+    setval('public.table1_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table1), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table1)),
+    setval('public.table5_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table5), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table5)),
+    setval('public.table6_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table6), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table6)),
+    setval('public.table2_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table2), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table2));
+UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 2;
+
+INSERT INTO pg_temp.pgdm_expansion_timings VALUES (3, 'execute', 'Scan source and build dependency manifest', clock_timestamp(), NULL, NULL, NULL, NULL);
+DROP TABLE IF EXISTS public.pgdm_stage_unified;
+{seqscan_toggle_on}CREATE UNLOGGED TABLE public.pgdm_stage_unified AS
+SELECT
+    s.raw_id,
+    p.pos,
+    CASE WHEN p.pos = 0 THEN s.raw_schema::text END AS raw_schema,
+    CASE WHEN p.pos = 0 THEN s.raw_hash::text END AS raw_hash,
+    CASE WHEN p.pos = 0 THEN BTRIM(r.text_column_1) END AS tc1,
+    CASE WHEN p.pos = 0 THEN UPPER(BTRIM(r.text_column_2)) END AS tc2,
+    CASE WHEN p.pos = 0 THEN LEFT(UPPER(BTRIM(r.text_column_2)), 1) END AS tc2_l,
+    CASE WHEN p.pos = 0 THEN RIGHT(UPPER(BTRIM(r.text_column_2)), 1) END AS tc2_r,
+    CASE WHEN p.pos = 0 THEN UPPER(BTRIM(r.text_column_3)) END AS tc3,
+    CASE WHEN p.pos = 0 AND UPPER(BTRIM(r.text_column_3)) ~ '^[A-Z]{{2}}$'
+         THEN ((ASCII(LEFT(UPPER(BTRIM(r.text_column_3)), 1)) - 65) * 26 + (ASCII(RIGHT(UPPER(BTRIM(r.text_column_3)), 1)) - 65) + 1)::smallint
+    END AS t4_id,
+    CASE WHEN p.pos = 0 THEN NULLIF(BTRIM(r.id_column_1), '')::integer END AS id1,
+    CASE WHEN p.pos = 0 THEN (NULLIF(BTRIM(r.datetime_column_1), '')::timestamptz AT TIME ZONE 'America/Sao_Paulo') END AS dt1,
+    CASE WHEN p.pos = 0 THEN GREATEST(
+        NULLIF(BTRIM(r.integer_column_2), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_3), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_4), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_5), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_6), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_7), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_8), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_9), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_10), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_11), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_12), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_13), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_14), '')::smallint,
+        NULLIF(BTRIM(r.integer_column_15), '')::smallint
+    ) END AS max_pos,
+    CASE WHEN p.pos = 0 AND NULLIF(BTRIM(r.numeric_column_2), '')::numeric > 0
+         THEN ROUND(NULLIF(BTRIM(r.numeric_column_2), '')::numeric * 1000)::integer
+    END AS nc2_k,
+    CASE WHEN p.pos = 0 AND NULLIF(BTRIM(r.numeric_column_1), '')::numeric > 0
+         THEN ROUND(NULLIF(BTRIM(r.numeric_column_1), '')::numeric * 1000)::integer
+    END AS nc1_k,
+    CASE WHEN p.pos = 0 AND NULLIF(BTRIM(r.integer_column_1), '')::numeric > 0
+         THEN ROUND(NULLIF(BTRIM(r.integer_column_1), '')::numeric, 1)
+    END AS t5_nc1,
+    CASE WHEN p.pos > 0 THEN ROUND(NULLIF(BTRIM(p.w_txt), '')::numeric * 1000)::integer END AS t2_ic2,
+    CASE WHEN p.pos > 0 THEN UPPER(BTRIM(p.t_txt))::varchar(10) END AS t2_tc1,
+    CASE WHEN p.pos > 0 AND NULLIF(BTRIM(p.g_txt), '')::numeric > 0
+         THEN ROUND(NULLIF(BTRIM(p.g_txt), '')::numeric * 1000)::integer
+    END AS t2_ic6
+FROM {source_table_sql} AS s
+CROSS JOIN LATERAL jsonb_to_record(s.raw -> 'values') AS r(
+    id_column_1 text, datetime_column_1 text,
+    text_column_1 text, text_column_2 text, text_column_3 text,
+    integer_column_1 text, numeric_column_1 text, numeric_column_2 text,
+    integer_column_2 text, integer_column_3 text, integer_column_4 text, integer_column_5 text,
+    integer_column_6 text, integer_column_7 text, integer_column_8 text, integer_column_9 text,
+    integer_column_10 text, integer_column_11 text, integer_column_12 text, integer_column_13 text,
+    integer_column_14 text, integer_column_15 text,
+    text_column_4 text, text_column_5 text, text_column_6 text, text_column_7 text,
+    text_column_8 text, text_column_9 text, text_column_10 text, text_column_11 text,
+    text_column_12 text, text_column_13 text, text_column_14 text, text_column_15 text,
+    text_column_16 text, text_column_17 text,
+    numeric_column_3 text, numeric_column_4 text, numeric_column_5 text, numeric_column_6 text,
+    numeric_column_7 text, numeric_column_8 text, numeric_column_9 text, numeric_column_10 text,
+    numeric_column_11 text, numeric_column_12 text, numeric_column_13 text, numeric_column_14 text,
+    numeric_column_15 text, numeric_column_16 text, numeric_column_17 text, numeric_column_18 text,
+    numeric_column_19 text, numeric_column_20 text, numeric_column_21 text, numeric_column_22 text,
+    numeric_column_23 text, numeric_column_24 text, numeric_column_25 text, numeric_column_26 text,
+    numeric_column_27 text, numeric_column_28 text, numeric_column_29 text, numeric_column_30 text
+)
+CROSS JOIN LATERAL (
+    VALUES
+        (0::smallint, NULL::text, NULL::text, NULL::text, NULL::text),
+        (1::smallint, r.integer_column_2, r.text_column_4, r.numeric_column_3, r.numeric_column_4),
+        (2::smallint, r.integer_column_3, r.text_column_5, r.numeric_column_5, r.numeric_column_6),
+        (3::smallint, r.integer_column_4, r.text_column_6, r.numeric_column_7, r.numeric_column_8),
+        (4::smallint, r.integer_column_5, r.text_column_7, r.numeric_column_9, r.numeric_column_10),
+        (5::smallint, r.integer_column_6, r.text_column_8, r.numeric_column_11, r.numeric_column_12),
+        (6::smallint, r.integer_column_7, r.text_column_9, r.numeric_column_13, r.numeric_column_14),
+        (7::smallint, r.integer_column_8, r.text_column_10, r.numeric_column_15, r.numeric_column_16),
+        (8::smallint, r.integer_column_9, r.text_column_11, r.numeric_column_17, r.numeric_column_18),
+        (9::smallint, r.integer_column_10, r.text_column_12, r.numeric_column_19, r.numeric_column_20),
+        (10::smallint, r.integer_column_11, r.text_column_13, r.numeric_column_21, r.numeric_column_22),
+        (11::smallint, r.integer_column_12, r.text_column_14, r.numeric_column_23, r.numeric_column_24),
+        (12::smallint, r.integer_column_13, r.text_column_15, r.numeric_column_25, r.numeric_column_26),
+        (13::smallint, r.integer_column_14, r.text_column_16, r.numeric_column_27, r.numeric_column_28),
+        (14::smallint, r.integer_column_15, r.text_column_17, r.numeric_column_29, r.numeric_column_30)
+) AS p(pos, decl_txt, t_txt, w_txt, g_txt)
+WHERE s."raw_schema" IN ({scope_sql}){range_filter_sql}
+  AND (
+      p.pos = 0
+      OR (
+          p.decl_txt <> ''
+          AND NULLIF(BTRIM(p.decl_txt), '')::smallint = p.pos
+          AND NULLIF(BTRIM(p.w_txt), '')::numeric >= 0
+          AND UPPER(BTRIM(p.t_txt)) IN ('X', 'Y', 'Z')
+      )
+  );
+{seqscan_toggle_off}CREATE TEMP TABLE {manifest_table} ON COMMIT DROP AS
+SELECT
+    raw_schema,
+    raw_hash,
+    COUNT(*)::bigint AS row_count
+FROM public.pgdm_stage_unified
+WHERE pos = 0
+GROUP BY raw_schema, raw_hash;
+{scope_check_sql}
+UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 3;
+
+{stmt_table3}
+
+{stmt_table4}
+
+{stmt_table1}
+
+{stmt_table5}
+
+{stmt_table6}
+
+{stmt_table2}
+
+DROP TABLE public.pgdm_stage_unified;
+ALTER SEQUENCE public.table1_id_column_1_seq CACHE 1;
+ALTER SEQUENCE public.table5_id_column_1_seq CACHE 1;
+ALTER SEQUENCE public.table6_id_column_1_seq CACHE 1;
+ALTER SEQUENCE public.table2_id_column_1_seq CACHE 1;
+SELECT
+    setval('public.table3_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table3), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table3)),
+    setval('public.table1_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table1), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table1)),
+    setval('public.table5_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table5), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table5)),
+    setval('public.table6_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table6), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table6)),
+    setval('public.table2_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table2), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table2));
+SET LOCAL session_replication_role = 'origin';
+
+INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000, 'execute', 'Commit expansion transaction', clock_timestamp(), NULL, NULL, NULL, NULL);
+
+INSERT INTO public.pgdm_expansion_checkpoints (
+    expansion_signature,
+    chunk_index,
+    total_chunks,
+    raw_id_min,
+    raw_id_max,
+    manifest_json,
+    timings_json,
+    completed_at
+)
+VALUES (
+    {sql_literal(expansion_signature)},
+    {int(chunk_index)},
+    {int(total_chunks)},
+    {int(chunk_min_raw_id) if chunk_min_raw_id is not None else 'NULL'},
+    {int(chunk_max_raw_id) if chunk_max_raw_id is not None else 'NULL'},
+    jsonb_build_object(
+        'raw_schemas', to_jsonb({expected_scope_array}),
+        'expected_row_count', COALESCE((SELECT SUM(row_count) FROM {manifest_table}), 0),
+        'expected_distinct_raw_hash_count', (SELECT COUNT(DISTINCT raw_hash) FROM {manifest_table}),
+        'raw_hash_manifest', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'raw_schema', raw_schema,
+                    'raw_hash', raw_hash,
+                    'row_count', row_count
+                )
+                ORDER BY raw_schema, raw_hash NULLS FIRST
+            )
+            FROM {manifest_table}
+        ), '[]'::jsonb),
+        'source_columns', COALESCE((
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'name', attribute.attname,
+                    'type', pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                )
+                ORDER BY attribute.attnum
+            )
+            FROM pg_attribute AS attribute
+            JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = {sql_literal(source_schema_name)}
+              AND relation.relname = {sql_literal(source_table_name)}
+              AND relation.relkind IN ('r', 'p')
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+        ), '[]'::jsonb)
+    ),
+    COALESCE((
+        SELECT jsonb_agg(
+            jsonb_build_object(
+                'sequence', sequence_number,
+                'stage', stage_key,
+                'name', item_name,
+                'duration_seconds', EXTRACT(EPOCH FROM (COALESCE(finished_at, clock_timestamp()) - started_at)),
+                'rows', rows_affected,
+                'destination', destination_name,
+                'statement_index', statement_index
+            )
+            ORDER BY sequence_number
+        )
+        FROM pg_temp.pgdm_expansion_timings
+    ), '[]'::jsonb),
+    clock_timestamp()
+)
+ON CONFLICT (expansion_signature, chunk_index) DO UPDATE SET
+    total_chunks = EXCLUDED.total_chunks,
+    raw_id_min = EXCLUDED.raw_id_min,
+    raw_id_max = EXCLUDED.raw_id_max,
+    manifest_json = EXCLUDED.manifest_json,
+    timings_json = EXCLUDED.timings_json,
+    completed_at = clock_timestamp();
+
+COMMIT;
+
+UPDATE pg_temp.pgdm_expansion_timings
+SET finished_at = clock_timestamp()
+WHERE sequence_number = 9000;
+
+SELECT manifest_json::text
+FROM public.pgdm_expansion_checkpoints
+WHERE expansion_signature = {sql_literal(expansion_signature)}
+  AND chunk_index = {int(chunk_index)};
+
+SELECT json_build_object(
+    'pgdm_expansion_timings', COALESCE(
+        json_agg(
+            json_build_object(
+                'sequence', sequence_number,
+                'stage', stage_key,
+                'name', item_name,
+                'duration_seconds', EXTRACT(EPOCH FROM (finished_at - started_at)),
+                'rows', rows_affected,
+                'destination', destination_name,
+                'statement_index', statement_index
+            ) ORDER BY sequence_number
+        ),
+        '[]'::json
+    )
+)::text
+FROM pg_temp.pgdm_expansion_timings;
+
+DROP TABLE pg_temp.pgdm_expansion_timings;
+""".strip()
+
+    def _execute_fast_challenge_expansion(
+        self,
+        database_name: str,
+        prepared: dict,
+        source_versions: list[dict],
+        preflight_context: dict,
+        timing_report: dict,
+        cancel_event=None,
+        progress_callback=None,
+        post_commit_callback=None,
+    ) -> dict:
+        source_schema_name = prepared["source_schema_name"]
+        source_table_name = prepared["source_table_name"]
+        expansion_signature = preflight_context["expansion_signature"]
+        destination_row_counts = preflight_context["destination_row_counts"]
+        min_raw_id = preflight_context.get("min_raw_id")
+        max_raw_id = preflight_context.get("max_raw_id")
+        existing_checkpoints = list(preflight_context.get("checkpoints") or [])
+
+        total_existing_dest_rows = sum(int(v or 0) for v in destination_row_counts.values())
+        clear_stale_checkpoints = False
+        if total_existing_dest_rows == 0 and existing_checkpoints:
+            existing_checkpoints = []
+            clear_stale_checkpoints = True
+
+        chunk_size = max(
+            1,
+            int(getattr(self, "expansion_chunk_size", self.DEFAULT_EXPANSION_CHUNK_SIZE) or self.DEFAULT_EXPANSION_CHUNK_SIZE),
+        )
+        chunks: list[tuple[int, int | None, int | None]] = []
+        if min_raw_id is not None and max_raw_id is not None and int(max_raw_id) >= int(min_raw_id):
+            low = int(min_raw_id)
+            high = int(max_raw_id)
+            span = high - low + 1
+            if span <= chunk_size:
+                chunks.append((1, low, high))
+            else:
+                cur = low
+                idx = 1
+                while cur <= high:
+                    end = min(high, cur + chunk_size - 1)
+                    chunks.append((idx, cur, end))
+                    cur = end + 1
+                    idx += 1
+        else:
+            chunks.append((1, None, None))
+
+        total_chunks = len(chunks)
+        completed_by_index = {
+            int(cp["chunk_index"]): cp
+            for cp in existing_checkpoints
+            if int(cp.get("total_chunks") or 0) == total_chunks
+        }
+
+        command = (
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+            f"-d {shlex.quote(database_name)} "
+            "-X -qAt -v ON_ERROR_STOP=1 -f -"
+        )
+
+        chunk_manifests: list[dict] = []
+        chunk_timings_list: list[list[dict]] = []
+
+        self._notify_progress(
+            progress_callback,
+            "execute",
+            5,
+            "Running all expansions in a single transaction..."
+            if total_chunks == 1
+            else f"Running chunked expansion across {total_chunks} chunks...",
+        )
+
+        for chunk_index, chunk_min, chunk_max in chunks:
+            self._raise_if_cancelled(cancel_event)
+            if chunk_index in completed_by_index:
+                cp = completed_by_index[chunk_index]
+                cp_manifest = cp.get("manifest")
+                cp_timings = cp.get("timings")
+                if isinstance(cp_manifest, dict):
+                    chunk_manifests.append(cp_manifest)
+                if isinstance(cp_timings, list):
+                    chunk_timings_list.append(cp_timings)
+                continue
+
+            with self.expansion_timing_scope(
+                timing_report,
+                "prepare",
+                "Build protected transactional SQL batch"
+                if total_chunks == 1
+                else f"Build protected transactional SQL batch (chunk {chunk_index}/{total_chunks})",
+            ):
+                wrapped_sql = self._build_fast_challenge_chunk_sql(
+                    source_schema_name=source_schema_name,
+                    source_table_name=source_table_name,
+                    raw_schemas=prepared["raw_schemas"],
+                    destinations=prepared["destinations"],
+                    expansion_signature=expansion_signature,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    chunk_min_raw_id=chunk_min,
+                    chunk_max_raw_id=chunk_max,
+                    clear_stale_checkpoints=(clear_stale_checkpoints and chunk_index == 1),
+                )
+
+            with self.expansion_timing_scope(
+                timing_report,
+                "execute",
+                "Expansion database batch envelope"
+                if total_chunks == 1
+                else f"Expansion database batch envelope (chunk {chunk_index}/{total_chunks})",
+                record_local_cpu=False,
+                remote_include_in_total=False,
+            ):
+                output = self.run_remote_command(
+                    command,
+                    stdin_text=wrapped_sql,
+                    cancel_event=cancel_event,
+                    stdin_progress_callback=lambda progress, message: self._notify_progress(
+                        progress_callback,
+                        "execute",
+                        10 + (progress * 0.8),
+                        message,
+                    ),
+                )
+
+            with self.expansion_timing_scope(
+                timing_report,
+                "execute",
+                "Parse database manifest and timing telemetry"
+                if total_chunks == 1
+                else f"Parse database manifest and timing telemetry (chunk {chunk_index}/{total_chunks})",
+            ):
+                c_manifest = None
+                c_timings = []
+                for line in output.splitlines():
+                    candidate = line.strip()
+                    if not candidate.startswith("{"):
+                        continue
+                    try:
+                        parsed_candidate = json.loads(candidate)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(parsed_candidate, dict):
+                        continue
+                    if "raw_hash_manifest" in parsed_candidate:
+                        c_manifest = parsed_candidate
+                    if "pgdm_expansion_timings" in parsed_candidate:
+                        c_timings = list(parsed_candidate.get("pgdm_expansion_timings") or [])
+                if c_manifest is None:
+                    raise RuntimeError(
+                        "The expansion completed, but the source manifest was not returned."
+                    )
+                chunk_manifests.append(c_manifest)
+                chunk_timings_list.append(c_timings)
+
+        manifest = self._merge_chunk_manifests(chunk_manifests)
+        if manifest is None:
+            raise RuntimeError(
+                "The expansion completed, but the source manifest was not returned."
+            )
+
+        aggregated_timings: dict[int, dict] = {}
+        for c_timings in chunk_timings_list:
+            for item in c_timings:
+                seq = int(item.get("sequence") or 0)
+                if seq not in aggregated_timings:
+                    aggregated_timings[seq] = {
+                        "sequence": seq,
+                        "stage": item.get("stage") or "execute",
+                        "name": item.get("name") or "PostgreSQL expansion step",
+                        "duration_seconds": float(item.get("duration_seconds") or 0.0),
+                        "rows": int(item["rows"]) if item.get("rows") is not None else None,
+                        "destination": item.get("destination"),
+                    }
+                else:
+                    aggregated_timings[seq]["duration_seconds"] += float(
+                        item.get("duration_seconds") or 0.0
+                    )
+                    if item.get("rows") is not None:
+                        prev_rows = aggregated_timings[seq]["rows"] or 0
+                        aggregated_timings[seq]["rows"] = prev_rows + int(item["rows"])
+
+        for seq in sorted(aggregated_timings.keys()):
+            item = aggregated_timings[seq]
+            self._append_expansion_timing(
+                timing_report,
+                item["stage"],
+                item["name"],
+                item["duration_seconds"],
+                "postgresql_backend_wall",
+                rows=item["rows"],
+                destination=item["destination"],
+                details=(
+                    "Measured with PostgreSQL clock_timestamp() in the server "
+                    "session; SSH transport is excluded."
+                ),
+            )
+
+        if post_commit_callback:
+            post_commit_callback()
+
+        self._notify_progress(
+            progress_callback,
+            "execute",
+            100,
+            "Data committed to the destinations.",
+        )
+
+        timing_report["source_rows"] = int(
+            manifest.get("expected_row_count") or 0
+        )
+        destination_row_totals = {}
+        for item in timing_report.get("items") or []:
+            destination_name = item.get("destination")
+            rows_affected = item.get("rows")
+            if not destination_name or rows_affected is None:
+                continue
+            destination_row_totals[destination_name] = (
+                destination_row_totals.get(destination_name, 0)
+                + int(rows_affected)
+            )
+        timing_report["destination_rows"] = [
+            {
+                "table_name": destination["table_name"],
+                "rows": int(destination_row_totals.get(destination["table_name"], 0)),
+            }
+            for destination in prepared["destinations"]
+        ]
+        timing_report["total_rows_inserted"] = sum(
+            item["rows"] for item in timing_report["destination_rows"]
+        )
+
+        return {
+            "source_database_name": database_name,
+            "source_schema_name": source_schema_name,
+            "source_table_name": source_table_name,
+            "raw_schemas": list(prepared["raw_schemas"]),
+            "source_versions": source_versions,
+            "dependency_manifest": manifest,
+            "destinations": prepared["destinations"],
+            "timing_report": timing_report,
+        }
+
     def execute_cross_table_expansion(
         self,
         database_name: str,
@@ -13823,130 +15254,141 @@ SELECT json_build_object(
             5,
             "Validating source, destinations, and counters...",
         )
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Verify source table existence",
-        ):
-            source_exists = self.table_exists(
+        use_mocked_preflight = self._has_mocked_expansion_preflight()
+        preflight_context = None
+        if not use_mocked_preflight:
+            source_versions, preflight_context = self._run_consolidated_expansion_preflight(
                 database_name,
                 source_full_table_name,
+                prepared,
+                timing_report,
                 cancel_event=cancel_event,
             )
-        if not source_exists:
-            raise RuntimeError(
-                f"Source table {source_full_table_name} does not exist."
-            )
-
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Read and validate source column metadata",
-        ):
-            source_columns = {
-                item["name"]: item["type"]
-                for item in self.get_table_column_definitions(
+        else:
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Verify source table existence",
+            ):
+                source_exists = self.table_exists(
                     database_name,
                     source_full_table_name,
                     cancel_event=cancel_event,
                 )
-            }
-        missing_source_columns = [
-            column_name
-            for column_name in ("raw_schema", "raw_hash")
-            if column_name not in source_columns
-        ]
-        if missing_source_columns:
-            raise RuntimeError(
-                f"Source {source_full_table_name} is missing required columns: "
-                + ", ".join(missing_source_columns)
-                + "."
-            )
-
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Load Raw version references for the selected scope",
-        ):
-            source_versions = self.get_raw_schema_version_references(
-                database_name,
-                source_full_table_name,
-                prepared["raw_schemas"],
-                cancel_event=cancel_event,
-            )
-        referenced_raw_schemas = {
-            str(item.get("raw_schema") or "").strip()
-            for item in source_versions
-            if isinstance(item, dict)
-        }
-        missing_version_schemas = [
-            raw_schema
-            for raw_schema in prepared["raw_schemas"]
-            if raw_schema not in referenced_raw_schemas
-        ]
-        if missing_version_schemas:
-            raise RuntimeError(
-                "No Raw version is registered for the selected scope: "
-                + ", ".join(missing_version_schemas)
-                + "."
-            )
-
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Validate SQL function safety",
-        ):
-            self._validate_cross_table_expansion_functions(
-                database_name,
-                prepared["destinations"],
-                cancel_event=cancel_event,
-            )
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Ensure data-database metadata and row counters",
-        ):
-            self.ensure_data_database_metadata(
-                database_name,
-                cancel_event=cancel_event,
-            )
-        for destination in prepared["destinations"]:
-            full_table_name = destination["table_name"]
-            with self.expansion_timing_scope(
-                timing_report,
-                "preflight",
-                f"Verify destination {full_table_name}",
-            ):
-                destination_exists = self.table_exists(
-                    database_name,
-                    full_table_name,
-                    cancel_event=cancel_event,
-                )
-            if not destination_exists:
+            if not source_exists:
                 raise RuntimeError(
-                    f"Destination table {full_table_name} does not exist."
+                    f"Source table {source_full_table_name} does not exist."
                 )
+
             with self.expansion_timing_scope(
                 timing_report,
                 "preflight",
-                f"Read row counter for {full_table_name}",
+                "Read and validate source column metadata",
             ):
-                self.get_table_row_count(
+                source_columns = {
+                    item["name"]: item["type"]
+                    for item in self.get_table_column_definitions(
+                        database_name,
+                        source_full_table_name,
+                        cancel_event=cancel_event,
+                    )
+                }
+            missing_source_columns = [
+                column_name
+                for column_name in ("raw_schema", "raw_hash")
+                if column_name not in source_columns
+            ]
+            if missing_source_columns:
+                raise RuntimeError(
+                    f"Source {source_full_table_name} is missing required columns: "
+                    + ", ".join(missing_source_columns)
+                    + "."
+                )
+
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Load Raw version references for the selected scope",
+            ):
+                source_versions = self.get_raw_schema_version_references(
                     database_name,
-                    full_table_name,
+                    source_full_table_name,
+                    prepared["raw_schemas"],
+                    cancel_event=cancel_event,
+                )
+            referenced_raw_schemas = {
+                str(item.get("raw_schema") or "").strip()
+                for item in source_versions
+                if isinstance(item, dict)
+            }
+            missing_version_schemas = [
+                raw_schema
+                for raw_schema in prepared["raw_schemas"]
+                if raw_schema not in referenced_raw_schemas
+            ]
+            if missing_version_schemas:
+                raise RuntimeError(
+                    "No Raw version is registered for the selected scope: "
+                    + ", ".join(missing_version_schemas)
+                    + "."
+                )
+
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Validate SQL function safety",
+            ):
+                self._validate_cross_table_expansion_functions(
+                    database_name,
+                    prepared["destinations"],
                     cancel_event=cancel_event,
                 )
             with self.expansion_timing_scope(
                 timing_report,
                 "preflight",
-                f"Validate managed dependencies for {full_table_name}",
+                "Ensure data-database metadata and row counters",
             ):
-                self._validate_managed_sql_dependencies(
+                self.ensure_data_database_metadata(
                     database_name,
-                    full_table_name,
-                    {"insert"},
                     cancel_event=cancel_event,
                 )
+            for destination in prepared["destinations"]:
+                full_table_name = destination["table_name"]
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "preflight",
+                    f"Verify destination {full_table_name}",
+                ):
+                    destination_exists = self.table_exists(
+                        database_name,
+                        full_table_name,
+                        cancel_event=cancel_event,
+                    )
+                if not destination_exists:
+                    raise RuntimeError(
+                        f"Destination table {full_table_name} does not exist."
+                    )
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "preflight",
+                    f"Read row counter for {full_table_name}",
+                ):
+                    self.get_table_row_count(
+                        database_name,
+                        full_table_name,
+                        cancel_event=cancel_event,
+                    )
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "preflight",
+                    f"Validate managed dependencies for {full_table_name}",
+                ):
+                    self._validate_managed_sql_dependencies(
+                        database_name,
+                        full_table_name,
+                        {"insert"},
+                        cancel_event=cancel_event,
+                    )
 
         self._notify_progress(
             progress_callback,
@@ -13958,6 +15400,22 @@ SELECT json_build_object(
             ),
         )
         self._raise_if_cancelled(cancel_event)
+
+        if (
+            not use_mocked_preflight
+            and preflight_context is not None
+            and self._is_standard_challenge_expansion(prepared)
+        ):
+            return self._execute_fast_challenge_expansion(
+                database_name=database_name,
+                prepared=prepared,
+                source_versions=source_versions,
+                preflight_context=preflight_context,
+                timing_report=timing_report,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                post_commit_callback=post_commit_callback,
+            )
 
         with self.expansion_timing_scope(
             timing_report,

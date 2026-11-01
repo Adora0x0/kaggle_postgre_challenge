@@ -1,0 +1,114 @@
+from pathlib import Path
+import unittest
+
+from services.postgres_service import PostgresAdminService
+
+
+SQL_DIR = Path(__file__).resolve().parents[1] / "SQL files"
+
+
+def _load_challenge_destinations():
+    mapping = [
+        ("public.table3", "01_table3.sql"),
+        ("public.table4", "02_table4.sql"),
+        ("public.table1", "03_table1.sql"),
+        ("public.table5", "04_table5.sql"),
+        ("public.table6", "05_table6.sql"),
+        ("public.table2", "06_table2.sql"),
+    ]
+    return [
+        {
+            "table_name": table_name,
+            "version_title": f"Expand {table_name}",
+            "sql": (SQL_DIR / filename).read_text(encoding="utf-8"),
+        }
+        for table_name, filename in mapping
+    ]
+
+
+class ExpansionRecoveryAndChunkingTests(unittest.TestCase):
+    def test_standard_challenge_expansion_is_recognized(self):
+        prepared = PostgresAdminService._prepare_cross_table_expansion(
+            "public.raw_data",
+            ["group001"],
+            _load_challenge_destinations(),
+        )
+        self.assertTrue(
+            PostgresAdminService._is_standard_challenge_expansion(prepared)
+        )
+
+    def test_merge_chunk_manifests_sums_row_counts_deterministically(self):
+        m1 = {
+            "raw_schemas": ["group001"],
+            "expected_row_count": 40000,
+            "expected_distinct_raw_hash_count": 1,
+            "raw_hash_manifest": [
+                {"raw_schema": "group001", "raw_hash": "abc123", "row_count": 40000}
+            ],
+            "source_columns": [{"name": "raw_id", "type": "bigint"}],
+        }
+        m2 = {
+            "raw_schemas": ["group001"],
+            "expected_row_count": 60000,
+            "expected_distinct_raw_hash_count": 1,
+            "raw_hash_manifest": [
+                {"raw_schema": "group001", "raw_hash": "abc123", "row_count": 60000}
+            ],
+            "source_columns": [{"name": "raw_id", "type": "bigint"}],
+        }
+        merged = PostgresAdminService._merge_chunk_manifests([m1, m2])
+        self.assertEqual(merged["expected_row_count"], 100000)
+        self.assertEqual(merged["expected_distinct_raw_hash_count"], 1)
+        self.assertEqual(
+            merged["raw_hash_manifest"],
+            [{"raw_schema": "group001", "raw_hash": "abc123", "row_count": 100000}],
+        )
+
+    def test_expansion_signature_changes_when_version_is_registered(self):
+        service = PostgresAdminService()
+        prepared = service._prepare_cross_table_expansion(
+            "public.raw_data",
+            ["group001"],
+            _load_challenge_destinations(),
+        )
+        source_versions = [{"version_code": "0000", "raw_schema": "group001"}]
+        sig_before = service._compute_expansion_signature(
+            "kaggle_challenge",
+            prepared,
+            source_versions,
+            registered_expansion_count=0,
+        )
+        sig_after = service._compute_expansion_signature(
+            "kaggle_challenge",
+            prepared,
+            source_versions,
+            registered_expansion_count=6,
+        )
+        self.assertNotEqual(sig_before, sig_after)
+
+    def test_fast_challenge_chunk_sql_includes_range_bounds_and_checkpoint(self):
+        service = PostgresAdminService()
+        prepared = service._prepare_cross_table_expansion(
+            "public.raw_data",
+            ["group001"],
+            _load_challenge_destinations(),
+        )
+        chunk_sql = service._build_fast_challenge_chunk_sql(
+            source_schema_name="public",
+            source_table_name="raw_data",
+            raw_schemas=["group001"],
+            destinations=prepared["destinations"],
+            expansion_signature="sig_test_123",
+            chunk_index=2,
+            total_chunks=3,
+            chunk_min_raw_id=40001,
+            chunk_max_raw_id=80000,
+        )
+        self.assertIn("s.raw_id BETWEEN 40001 AND 80000", chunk_sql)
+        self.assertIn("SET LOCAL enable_seqscan = off;", chunk_sql)
+        self.assertIn("INSERT INTO public.pgdm_expansion_checkpoints", chunk_sql)
+        self.assertIn("ALTER SEQUENCE public.table1_id_column_1_seq CACHE 100000;", chunk_sql)
+
+
+if __name__ == "__main__":
+    unittest.main()

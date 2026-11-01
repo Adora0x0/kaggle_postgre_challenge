@@ -3,15 +3,17 @@ INSERT INTO public.table4 (
     text_column_1,
     text_column_2
 )
-SELECT DISTINCT
+SELECT
     (
-        (ASCII(LEFT(UPPER(BTRIM(source_row.raw -> 'values' ->> 'text_column_3')), 1))
-            - ASCII('A')) * 26
-        + ASCII(RIGHT(UPPER(BTRIM(source_row.raw -> 'values' ->> 'text_column_3')), 1))
-        - ASCII('A')
+        (ASCII(LEFT(dedup.tc3, 1)) - 65) * 26
+        + (ASCII(RIGHT(dedup.tc3, 1)) - 65)
         + 1
     )::smallint,
     'SYNTHETIC/GENERIC',
-    UPPER(BTRIM(source_row.raw -> 'values' ->> 'text_column_3'))
-FROM {{source}} AS source_row
-WHERE UPPER(BTRIM(source_row.raw -> 'values' ->> 'text_column_3')) ~ '^[A-Z]{2}$';
+    dedup.tc3
+FROM (
+    SELECT DISTINCT
+        UPPER(BTRIM(source_row.raw -> 'values' ->> 'text_column_3')) AS tc3
+    FROM {{source}} AS source_row
+) AS dedup
+WHERE COALESCE(dedup.tc3, '') ~ '^[A-Z]{2}$';
