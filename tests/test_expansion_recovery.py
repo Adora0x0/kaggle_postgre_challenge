@@ -110,6 +110,8 @@ class ExpansionRecoveryAndChunkingTests(unittest.TestCase):
         self.assertIn("ALTER SEQUENCE public.table1_id_column_1_seq CACHE 100000;", chunk_sql)
         self.assertIn("$pgdm_fk_pre$", chunk_sql)
         self.assertIn("NOT VALID", chunk_sql)
+        self.assertIn("DROP CONSTRAINT IF EXISTS table2_pkey;", chunk_sql)
+        self.assertNotIn("ADD CONSTRAINT table2_pkey PRIMARY KEY", chunk_sql)
 
         final_chunk_sql = service._build_fast_challenge_chunk_sql(
             source_schema_name="public",
@@ -123,6 +125,9 @@ class ExpansionRecoveryAndChunkingTests(unittest.TestCase):
             chunk_max_raw_id=100000,
         )
         self.assertNotIn("NOT VALID", final_chunk_sql)
+        self.assertIn("SET LOCAL max_parallel_maintenance_workers = 0;", final_chunk_sql)
+        self.assertIn("SET LOCAL maintenance_work_mem = '512MB';", final_chunk_sql)
+        self.assertIn("ADD CONSTRAINT table2_pkey PRIMARY KEY (id_column_1)", final_chunk_sql)
 
     def test_custom_modified_recipe_uses_general_path(self):
         dests = _load_challenge_destinations()

@@ -14528,8 +14528,7 @@ FROM (
     SELECT DISTINCT tc1, tc2_l, tc2_r
     FROM public.pgdm_stage_unified
     WHERE pos = 0
-      AND COALESCE(tc1, '') <> ''
-      AND COALESCE(tc2, '') ~ '^[A-Z]{2}$'
+      AND t3_ok
 ) d
 WHERE NOT EXISTS (
     SELECT 1
@@ -14723,7 +14722,28 @@ WHERE s.pos > 0""",
             timing_statement_index=1,
         )
 
-        not_valid_clause = "" if int(chunk_index) == int(total_chunks) else " NOT VALID"
+        is_final_chunk = int(chunk_index) == int(total_chunks)
+        not_valid_clause = "" if is_final_chunk else " NOT VALID"
+        rebuild_indexes_sql = ""
+        if is_final_chunk:
+            rebuild_indexes_sql = """
+ALTER TABLE public.table1
+    ADD CONSTRAINT table1_id_column_3_key UNIQUE (id_column_3);
+ALTER TABLE public.table2
+    ADD CONSTRAINT table2_pkey PRIMARY KEY (id_column_1),
+    ADD CONSTRAINT table2_id_column_2_integer_column_1_key UNIQUE (id_column_2, integer_column_1);
+ALTER TABLE public.table5
+    ADD CONSTRAINT table5_pkey PRIMARY KEY (id_column_1);
+CREATE UNIQUE INDEX IF NOT EXISTS table5_id_column_2_when_id_column_3_null_key
+    ON public.table5 USING btree (id_column_2)
+    WHERE (id_column_3 IS NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS table5_id_column_3_not_null_key
+    ON public.table5 USING btree (id_column_3)
+    WHERE (id_column_3 IS NOT NULL);
+ALTER TABLE public.table6
+    ADD CONSTRAINT table6_pkey PRIMARY KEY (id_column_1),
+    ADD CONSTRAINT table6_id_column_2_id_column_3_key UNIQUE (id_column_2, id_column_3);
+""".strip() + "\n"
         return f"""
 SET temp_buffers = '256MB';
 CREATE TEMP TABLE pgdm_expansion_timings (
@@ -14742,19 +14762,26 @@ INSERT INTO pg_temp.pgdm_expansion_timings VALUES (1, 'execute', 'Initialize dat
 SET LOCAL client_min_messages = warning;
 SET LOCAL synchronous_commit = off;
 SET LOCAL work_mem = '256MB';
-SET LOCAL maintenance_work_mem = '256MB';
+SET LOCAL maintenance_work_mem = '512MB';
 SET LOCAL max_parallel_workers_per_gather = 6;
-SET LOCAL max_parallel_maintenance_workers = 4;
+SET LOCAL max_parallel_maintenance_workers = 0;
 SET LOCAL parallel_setup_cost = 0;
 SET LOCAL parallel_tuple_cost = 0;
 SET LOCAL min_parallel_table_scan_size = 0;
 SET LOCAL min_parallel_index_scan_size = 0;
+SET LOCAL enable_memoize = off;
 SET LOCAL jit = off;
 UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 1;
 
 INSERT INTO pg_temp.pgdm_expansion_timings VALUES (2, 'execute', 'Acquire destination table locks', clock_timestamp(), NULL, NULL, NULL, NULL);
 {destination_lock_sql}
-{cleanup_checkpoints_sql}DO $pgdm_fk_pre$
+{cleanup_checkpoints_sql}SELECT
+    setval('public.table3_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table3), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table3)),
+    setval('public.table1_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table1), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table1)),
+    setval('public.table5_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table5), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table5)),
+    setval('public.table6_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table6), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table6)),
+    setval('public.table2_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table2), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table2));
+DO $pgdm_fk_pre$
 BEGIN
     BEGIN
         EXECUTE 'SET LOCAL session_replication_role = ''replica''';
@@ -14774,16 +14801,22 @@ BEGIN
     END;
 END
 $pgdm_fk_pre$;
+ALTER TABLE public.table1
+    DROP CONSTRAINT IF EXISTS table1_id_column_3_key;
+ALTER TABLE public.table2
+    DROP CONSTRAINT IF EXISTS table2_id_column_2_integer_column_1_key,
+    DROP CONSTRAINT IF EXISTS table2_pkey;
+DROP INDEX IF EXISTS public.table5_id_column_2_when_id_column_3_null_key;
+DROP INDEX IF EXISTS public.table5_id_column_3_not_null_key;
+ALTER TABLE public.table5
+    DROP CONSTRAINT IF EXISTS table5_pkey;
+ALTER TABLE public.table6
+    DROP CONSTRAINT IF EXISTS table6_id_column_2_id_column_3_key,
+    DROP CONSTRAINT IF EXISTS table6_pkey;
 ALTER SEQUENCE public.table1_id_column_1_seq CACHE 100000;
 ALTER SEQUENCE public.table5_id_column_1_seq CACHE 100000;
 ALTER SEQUENCE public.table6_id_column_1_seq CACHE 100000;
 ALTER SEQUENCE public.table2_id_column_1_seq CACHE 250000;
-SELECT
-    setval('public.table3_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table3), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table3)),
-    setval('public.table1_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table1), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table1)),
-    setval('public.table5_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table5), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table5)),
-    setval('public.table6_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table6), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table6)),
-    setval('public.table2_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table2), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table2));
 UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 2;
 
 INSERT INTO pg_temp.pgdm_expansion_timings VALUES (3, 'execute', 'Scan source and build dependency manifest', clock_timestamp(), NULL, NULL, NULL, NULL);
@@ -14795,7 +14828,7 @@ SELECT
     CASE WHEN p.pos = 0 THEN s.raw_schema::text END AS raw_schema,
     CASE WHEN p.pos = 0 THEN s.raw_hash::text END AS raw_hash,
     CASE WHEN p.pos = 0 THEN BTRIM(r.text_column_1) END AS tc1,
-    CASE WHEN p.pos = 0 THEN UPPER(BTRIM(r.text_column_2)) END AS tc2,
+    CASE WHEN p.pos = 0 THEN (COALESCE(BTRIM(r.text_column_1), '') <> '' AND COALESCE(UPPER(BTRIM(r.text_column_2)), '') ~ '^[A-Z]{{2}}$') END AS t3_ok,
     CASE WHEN p.pos = 0 THEN LEFT(UPPER(BTRIM(r.text_column_2)), 1) END AS tc2_l,
     CASE WHEN p.pos = 0 THEN RIGHT(UPPER(BTRIM(r.text_column_2)), 1) END AS tc2_r,
     CASE WHEN p.pos = 0 THEN UPPER(BTRIM(r.text_column_3)) END AS tc3,
@@ -14883,7 +14916,8 @@ WHERE s."raw_schema" IN ({scope_sql}){range_filter_sql}
           AND UPPER(BTRIM(p.t_txt)) IN ('X', 'Y', 'Z')
       )
   );
-{seqscan_toggle_off}CREATE TEMP TABLE {manifest_table} ON COMMIT DROP AS
+{seqscan_toggle_off}SET LOCAL max_parallel_workers_per_gather = 0;
+CREATE TEMP TABLE {manifest_table} ON COMMIT DROP AS
 SELECT
     raw_schema,
     raw_hash,
@@ -14906,8 +14940,9 @@ UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE 
 
 {stmt_table2}
 
+INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000, 'execute', 'Commit expansion transaction', clock_timestamp(), NULL, NULL, NULL, NULL);
 DROP TABLE public.pgdm_stage_unified;
-ALTER SEQUENCE public.table1_id_column_1_seq CACHE 1;
+{rebuild_indexes_sql}ALTER SEQUENCE public.table1_id_column_1_seq CACHE 1;
 ALTER SEQUENCE public.table5_id_column_1_seq CACHE 1;
 ALTER SEQUENCE public.table6_id_column_1_seq CACHE 1;
 ALTER SEQUENCE public.table2_id_column_1_seq CACHE 1;
@@ -14935,8 +14970,6 @@ BEGIN
     END IF;
 END
 $pgdm_fk_post$;
-
-INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000, 'execute', 'Commit expansion transaction', clock_timestamp(), NULL, NULL, NULL, NULL);
 
 INSERT INTO public.pgdm_expansion_checkpoints (
     expansion_signature,

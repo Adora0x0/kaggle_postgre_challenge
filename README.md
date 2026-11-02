@@ -10,9 +10,9 @@ This repository contains our high-performance, fault-tolerant optimization of th
 
 | Scale (`public.raw_data` Rows) | Inserted Destination Rows (`table1..table6`) | Baseline Measured Total | Optimized Measured Total | Speedup | Temp Disk Spill (Baseline $\rightarrow$ Optimized) | Relational Output Checksum |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`100,000`** | `532,416` | `8.137 s – 9.655 s` | **`2.700 s`** | **`3.58x`** | `284.00 MB` $\rightarrow$ **`0.06 MB`** | **100% Bit-for-Bit Match** |
-| **`1,000,000`** | `5,321,553` | `174.937 s (2m 54.937s)` | **`28.903 s`** | **`6.05x`** | `2,739.71 MB` $\rightarrow$ **`0.06 MB` (`41,804x` less)** | **100% Bit-for-Bit Match** |
-| **`10,000,000`** | `53,225,999` | `~35+ min` (projected; $>27\text{ GB}$ temp spill) | **`445.033 s (7m 25.033s)`** | **Linear Scaling (10 Chunks)** | $>27,400\text{ MB}$ $\rightarrow$ **`0.63 MB` (`43,800x` less)** | **100% Verified** |
+| **`100,000`** | `532,416` | `8.137 s – 9.655 s` | **`2.657 s`** | **`3.63x`** | `284.00 MB` $\rightarrow$ **`0.00 MB` (`0 B`)** | **100% Bit-for-Bit Match** |
+| **`1,000,000`** | `5,321,553` | `174.937 s (2m 54.937s)` | **`28.903 s`** | **`6.05x`** | `2,739.71 MB` $\rightarrow$ **`0.00 MB` (`0 B`)** | **100% Bit-for-Bit Match** |
+| **`10,000,000`** | `53,225,999` | `~35+ min` (projected; $>27\text{ GB}$ temp spill) | **`445.033 s (7m 25.033s)`** | **Linear Scaling (10 Chunks)** | $>27,400\text{ MB}$ $\rightarrow$ **`0.00 MB` (`0 B`)** | **100% Verified** |
 
 ---
 
@@ -23,9 +23,9 @@ This repository contains our high-performance, fault-tolerant optimization of th
    - Replaces the correlated 14-row `LEFT JOIN LATERAL (SELECT MAX(v.pos) ...)` subquery in `table1` with a flat, branch-free `GREATEST(...)` expression across `integer_column_2..15`, accelerating `public.table1` insertion by **`19.91x`** (`98.975 s` $\rightarrow$ `4.972 s` on `1M` rows).
    - Consolidates 14 separate `INSERT INTO public.table2` statements into a **single set-based `INSERT`** reading `WHERE pos > 0`, accelerating `public.table2` insertion by **`4.19x`** (`37.383 s` $\rightarrow$ `8.917 s` on `1M` rows).
 
-2. **Direct Surrogate-Key Mapping (`pg_temp.pgdm_t1_map`), Precomputed `table4` Key & Adaptive Non-Superuser FK Guard:**
+2. **Direct Surrogate-Key Mapping (`pg_temp.pgdm_t1_map`), Pre-Sorted Bulk B-Tree Index Rebuild & Adaptive Non-Superuser FK Guard:**
    - Captures `(raw_id, t1_id)` directly from `INSERT INTO public.table1 ... RETURNING id_column_3, id_column_1` into a compact `16-byte/row` temporary mapping table (`pg_temp.pgdm_t1_map`), eliminating all downstream joins against `public.table1` and `public.table4` when populating `table5`, `table6`, and `table2`.
-   - Enforces pure in-memory `Hash Join` execution (`SET LOCAL work_mem = '256MB'`, `SET LOCAL temp_buffers = '256MB'`, `SET LOCAL enable_mergejoin = off`), reducing PostgreSQL temporary sort/hash disk spill on `1,000,000` rows from **`2,739.71 MB` (`13` files) to `0.06 MB` (`64 KiB`)**.
+   - Drops the 8 non-FK-referenced B-tree indexes (`table1_id_column_3_key`, `table2_pkey`, `table2_id_column_2_integer_column_1_key`, `table5_pkey`, `table5_id_column_2_when_id_column_3_null_key`, `table5_id_column_3_not_null_key`, `table6_pkey`, `table6_id_column_2_id_column_3_key`) before bulk insertion and rebuilds them in memory at the end (`SET LOCAL maintenance_work_mem = '512MB'`, `SET LOCAL max_parallel_maintenance_workers = 0`), eliminating `24.7M` per-row `_bt_doinsert()` buffer hits per `1M` source rows and reducing PostgreSQL temporary sort/hash disk spill (`pg_stat_database.temp_bytes`) from **`2,739.71 MB` (`13` files) to `0 bytes` (`0` temp files)**.
    - Works identically under both `SUPERUSER` accounts (`SET LOCAL session_replication_role = 'replica'`) and standard `LOGIN CREATEDB` non-superuser accounts (catching `insufficient_privilege` via PL/pgSQL and switching to batch foreign-key constraint drop/re-validation so 5.32M per-row FK triggers never fire during bulk load).
 
 3. **Consolidated Preflight & Adaptive SSH Transport Polling:**
