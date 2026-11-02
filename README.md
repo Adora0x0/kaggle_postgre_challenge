@@ -23,9 +23,10 @@ This repository contains our high-performance, fault-tolerant optimization of th
    - Replaces the correlated 14-row `LEFT JOIN LATERAL (SELECT MAX(v.pos) ...)` subquery in `table1` with a flat, branch-free `GREATEST(...)` expression across `integer_column_2..15`, accelerating `public.table1` insertion by **`19.91x`** (`98.975 s` $\rightarrow$ `4.972 s` on `1M` rows).
    - Consolidates 14 separate `INSERT INTO public.table2` statements into a **single set-based `INSERT`** reading `WHERE pos > 0`, accelerating `public.table2` insertion by **`4.19x`** (`37.383 s` $\rightarrow$ `8.917 s` on `1M` rows).
 
-2. **Direct Surrogate-Key Mapping (`pg_temp.pgdm_t1_map`) & Precomputed `table4` Key:**
+2. **Direct Surrogate-Key Mapping (`pg_temp.pgdm_t1_map`), Precomputed `table4` Key & Adaptive Non-Superuser FK Guard:**
    - Captures `(raw_id, t1_id)` directly from `INSERT INTO public.table1 ... RETURNING id_column_3, id_column_1` into a compact `16-byte/row` temporary mapping table (`pg_temp.pgdm_t1_map`), eliminating all downstream joins against `public.table1` and `public.table4` when populating `table5`, `table6`, and `table2`.
    - Enforces pure in-memory `Hash Join` execution (`SET LOCAL work_mem = '256MB'`, `SET LOCAL temp_buffers = '256MB'`, `SET LOCAL enable_mergejoin = off`), reducing PostgreSQL temporary sort/hash disk spill on `1,000,000` rows from **`2,739.71 MB` (`13` files) to `0.06 MB` (`64 KiB`)**.
+   - Works identically under both `SUPERUSER` accounts (`SET LOCAL session_replication_role = 'replica'`) and standard `LOGIN CREATEDB` non-superuser accounts (catching `insufficient_privilege` via PL/pgSQL and switching to batch foreign-key constraint drop/re-validation so 5.32M per-row FK triggers never fire during bulk load).
 
 3. **Consolidated Preflight & Adaptive SSH Transport Polling:**
    - Collapses **23–29 sequential `psql` process startups** during preflight validation into **2 consolidated JSON queries** (1 against `CONTROL_DB` and 1 against `kaggle_challenge`), reducing preflight latency by **`7.16x–18.1x`** (`523.77 ms` $\rightarrow$ `73.16 ms`).

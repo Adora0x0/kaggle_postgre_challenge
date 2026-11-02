@@ -108,6 +108,47 @@ class ExpansionRecoveryAndChunkingTests(unittest.TestCase):
         self.assertIn("SET LOCAL enable_seqscan = off;", chunk_sql)
         self.assertIn("INSERT INTO public.pgdm_expansion_checkpoints", chunk_sql)
         self.assertIn("ALTER SEQUENCE public.table1_id_column_1_seq CACHE 100000;", chunk_sql)
+        self.assertIn("$pgdm_fk_pre$", chunk_sql)
+        self.assertIn("NOT VALID", chunk_sql)
+
+        final_chunk_sql = service._build_fast_challenge_chunk_sql(
+            source_schema_name="public",
+            source_table_name="raw_data",
+            raw_schemas=["group001"],
+            destinations=prepared["destinations"],
+            expansion_signature="sig_test_123",
+            chunk_index=3,
+            total_chunks=3,
+            chunk_min_raw_id=80001,
+            chunk_max_raw_id=100000,
+        )
+        self.assertNotIn("NOT VALID", final_chunk_sql)
+
+    def test_custom_modified_recipe_uses_general_path(self):
+        dests = _load_challenge_destinations()
+        dests[0]["sql"] = dests[0]["sql"].replace("SYNTHETIC/REFERENCE", "CUSTOM/OVERRIDE")
+        prepared = PostgresAdminService._prepare_cross_table_expansion(
+            "public.raw_data",
+            ["group001"],
+            dests,
+        )
+        self.assertFalse(
+            PostgresAdminService._is_standard_challenge_expansion(prepared)
+        )
+
+    def test_list_tables_hides_internal_expansion_tables(self):
+        service = PostgresAdminService()
+        service.run_remote_command = lambda cmd, cancel_event=None: (
+            "public.pgdm_expansion_checkpoints\n"
+            "public.pgdm_stage_unified\n"
+            "public.pgdm_table_row_counts\n"
+            "public.raw_data\n"
+            "public.table1\n"
+        )
+        self.assertEqual(
+            service.list_tables("kaggle_challenge"),
+            ["public.raw_data", "public.table1"],
+        )
 
 
 if __name__ == "__main__":

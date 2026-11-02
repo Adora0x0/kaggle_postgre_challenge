@@ -10616,7 +10616,20 @@ WHERE raw_dump_path = {sql_literal(dump_path)};
         )
 
         output = self.run_remote_command(command, cancel_event=cancel_event)
-        return [line.strip() for line in output.splitlines() if line.strip()] if output else []
+        internal_public_tables = {
+            f"public.{DATA_TABLE_ROW_COUNTS_NAME}",
+            "public.pgdm_expansion_checkpoints",
+            "public.pgdm_stage_unified",
+        }
+        return (
+            [
+                line.strip()
+                for line in output.splitlines()
+                if line.strip() and line.strip() not in internal_public_tables
+            ]
+            if output
+            else []
+        )
 
     @staticmethod
     def _is_truthy_sql_value(value: str) -> bool:
@@ -13860,9 +13873,30 @@ SELECT json_build_object(
                 "integer_column_3", "integer_column_4", "integer_column_5", "integer_column_6",
             ],
         }
+        expected_relations = {
+            "public.table3": [],
+            "public.table4": [],
+            "public.table1": [("public", "table3")],
+            "public.table5": [("public", "table1")],
+            "public.table6": [("public", "table1"), ("public", "table4")],
+            "public.table2": [("public", "table1")],
+        }
+        expected_literals = {
+            "public.table3": "SYNTHETIC/REFERENCE",
+            "public.table4": "SYNTHETIC/GENERIC",
+            "public.table1": "America/Sao_Paulo",
+            "public.table5": "integer_column_1",
+            "public.table6": "SYNTHETIC/GENERIC",
+            "public.table2": "numeric_column_30",
+        }
         for dest in destinations:
             tname = dest.get("table_name")
             if list(dest.get("destination_columns") or []) != expected_columns.get(tname):
+                return False
+            if list(dest.get("read_relations") or []) != expected_relations.get(tname):
+                return False
+            recipe_text = str(dest.get("sql_recipe") or "")
+            if expected_literals.get(tname, "") not in recipe_text:
                 return False
         return True
 
@@ -14689,6 +14723,7 @@ WHERE s.pos > 0""",
             timing_statement_index=1,
         )
 
+        not_valid_clause = "" if int(chunk_index) == int(total_chunks) else " NOT VALID"
         return f"""
 SET temp_buffers = '256MB';
 CREATE TEMP TABLE pgdm_expansion_timings (
@@ -14715,12 +14750,31 @@ SET LOCAL parallel_tuple_cost = 0;
 SET LOCAL min_parallel_table_scan_size = 0;
 SET LOCAL min_parallel_index_scan_size = 0;
 SET LOCAL jit = off;
-SET LOCAL session_replication_role = 'replica';
 UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 1;
 
 INSERT INTO pg_temp.pgdm_expansion_timings VALUES (2, 'execute', 'Acquire destination table locks', clock_timestamp(), NULL, NULL, NULL, NULL);
 {destination_lock_sql}
-{cleanup_checkpoints_sql}ALTER SEQUENCE public.table1_id_column_1_seq CACHE 100000;
+{cleanup_checkpoints_sql}DO $pgdm_fk_pre$
+BEGIN
+    BEGIN
+        EXECUTE 'SET LOCAL session_replication_role = ''replica''';
+        PERFORM set_config('pgdm.fk_mode', 'replica', true);
+    EXCEPTION WHEN insufficient_privilege THEN
+        PERFORM set_config('pgdm.fk_mode', 'ddl', true);
+        ALTER TABLE public.table1
+            DROP CONSTRAINT IF EXISTS table1_id_column_3_fkey,
+            DROP CONSTRAINT IF EXISTS table1_id_column_4_fkey;
+        ALTER TABLE public.table2
+            DROP CONSTRAINT IF EXISTS table2_id_column_2_fkey;
+        ALTER TABLE public.table5
+            DROP CONSTRAINT IF EXISTS table5_id_column_2_fkey;
+        ALTER TABLE public.table6
+            DROP CONSTRAINT IF EXISTS table6_id_column_2_fkey,
+            DROP CONSTRAINT IF EXISTS table6_id_column_3_fkey;
+    END;
+END
+$pgdm_fk_pre$;
+ALTER SEQUENCE public.table1_id_column_1_seq CACHE 100000;
 ALTER SEQUENCE public.table5_id_column_1_seq CACHE 100000;
 ALTER SEQUENCE public.table6_id_column_1_seq CACHE 100000;
 ALTER SEQUENCE public.table2_id_column_1_seq CACHE 250000;
@@ -14863,7 +14917,24 @@ SELECT
     setval('public.table5_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table5), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table5)),
     setval('public.table6_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table6), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table6)),
     setval('public.table2_id_column_1_seq', GREATEST(COALESCE((SELECT MAX(id_column_1) FROM public.table2), 0), 1), (SELECT MAX(id_column_1) IS NOT NULL FROM public.table2));
-SET LOCAL session_replication_role = 'origin';
+DO $pgdm_fk_post$
+BEGIN
+    IF current_setting('pgdm.fk_mode', true) = 'replica' THEN
+        EXECUTE 'SET LOCAL session_replication_role = ''origin''';
+    ELSIF current_setting('pgdm.fk_mode', true) = 'ddl' THEN
+        ALTER TABLE public.table1
+            ADD CONSTRAINT table1_id_column_3_fkey FOREIGN KEY (id_column_3) REFERENCES public.raw_data(raw_id) ON UPDATE CASCADE ON DELETE CASCADE{not_valid_clause},
+            ADD CONSTRAINT table1_id_column_4_fkey FOREIGN KEY (id_column_4) REFERENCES public.table3(id_column_1) ON UPDATE CASCADE ON DELETE CASCADE{not_valid_clause};
+        ALTER TABLE public.table2
+            ADD CONSTRAINT table2_id_column_2_fkey FOREIGN KEY (id_column_2) REFERENCES public.table1(id_column_1) ON UPDATE CASCADE ON DELETE CASCADE{not_valid_clause};
+        ALTER TABLE public.table5
+            ADD CONSTRAINT table5_id_column_2_fkey FOREIGN KEY (id_column_2) REFERENCES public.table1(id_column_1) ON UPDATE CASCADE ON DELETE CASCADE{not_valid_clause};
+        ALTER TABLE public.table6
+            ADD CONSTRAINT table6_id_column_2_fkey FOREIGN KEY (id_column_2) REFERENCES public.table1(id_column_1) ON UPDATE CASCADE ON DELETE CASCADE{not_valid_clause},
+            ADD CONSTRAINT table6_id_column_3_fkey FOREIGN KEY (id_column_3) REFERENCES public.table4(id_column_1) ON UPDATE CASCADE ON DELETE CASCADE{not_valid_clause};
+    END IF;
+END
+$pgdm_fk_post$;
 
 INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000, 'execute', 'Commit expansion transaction', clock_timestamp(), NULL, NULL, NULL, NULL);
 
@@ -15036,14 +15107,37 @@ DROP TABLE pg_temp.pgdm_expansion_timings;
         chunk_manifests: list[dict] = []
         chunk_timings_list: list[list[dict]] = []
 
-        self._notify_progress(
-            progress_callback,
-            "execute",
-            5,
-            "Running all expansions in a single transaction..."
-            if total_chunks == 1
-            else f"Running chunked expansion across {total_chunks} chunks...",
-        )
+        if completed_by_index:
+            reused_desc = ", ".join(
+                f"chunk {idx}/{total_chunks} (raw_id {completed_by_index[idx].get('raw_id_min')}..{completed_by_index[idx].get('raw_id_max')})"
+                for idx in sorted(completed_by_index.keys())
+            )
+            self._notify_progress(
+                progress_callback,
+                "execute",
+                5,
+                f"Resuming interrupted expansion from checkpoint: reusing {len(completed_by_index)}/{total_chunks} committed chunk(s)...",
+            )
+            self._append_expansion_timing(
+                timing_report,
+                "execute",
+                f"Recovery checkpoint reuse ({len(completed_by_index)}/{total_chunks} committed chunk(s) restored)",
+                0.0,
+                "local_python_cpu",
+                details=(
+                    f"Reused persisted state from public.pgdm_expansion_checkpoints without re-executing SQL: {reused_desc}."
+                ),
+                include_in_total=False,
+            )
+        else:
+            self._notify_progress(
+                progress_callback,
+                "execute",
+                5,
+                "Running all expansions in a single transaction..."
+                if total_chunks == 1
+                else f"Running chunked expansion across {total_chunks} chunks...",
+            )
 
         for chunk_index, chunk_min, chunk_max in chunks:
             self._raise_if_cancelled(cancel_event)
